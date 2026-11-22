@@ -8,7 +8,15 @@ from uuid import UUID, uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict
 
-from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
+from ecommerce_store_agent_orchestrator.domain.evidence import FailureCode, HandoffSnapshot, ReviewSnapshot, RunFailure
+from ecommerce_store_agent_orchestrator.domain.review import (
+    CiEvidence,
+    DecisionKind,
+    Publication,
+    PublicationReceipt,
+    ReviewDecision,
+    Reviewer,
+)
 from ecommerce_store_agent_orchestrator.domain.runs import (
     RunInput,
     RunOwner,
@@ -32,6 +40,20 @@ class RunNotFoundError(Exception):
     pass
 
 
+class StaleFeatureHashError(Exception):
+    pass
+
+
+class ReviewClosedError(Exception):
+    pass
+
+
+class WorkflowStepError(Exception):
+    def __init__(self, code: FailureCode, detail: str) -> None:
+        super().__init__(detail)
+        self.failure = RunFailure(code=code, detail=detail)
+
+
 class RunRepository(Protocol):
     def insert_or_get(self, run: WorkflowRun, idempotency_key: str) -> WorkflowRun: ...
 
@@ -41,7 +63,9 @@ class RunRepository(Protocol):
         self, owner: RunOwner, status: RunStatus | None, after: RunPosition | None, limit: int
     ) -> list[WorkflowRun]: ...
 
-    def claim_ready(self, now: datetime, lease: timedelta, *, with_authoring: bool = False) -> WorkClaim | None: ...
+    def claim_ready(
+        self, now: datetime, lease: timedelta, *, with_authoring: bool = False, with_publication: bool = False
+    ) -> WorkClaim | None: ...
 
     def mark_handoff_ready(self, claim: WorkClaim, at: datetime) -> bool: ...
 
@@ -53,7 +77,15 @@ class RunRepository(Protocol):
 
     def mark_review_ready(self, claim: WorkClaim, at: datetime) -> bool: ...
 
-    def fail_authoring(self, claim: WorkClaim, failure: RunFailure, at: datetime) -> bool: ...
+    def record_decision(self, run: WorkflowRun, decision: ReviewDecision) -> RunStatus | None: ...
+
+    def finish_rejection(self, claim: WorkClaim) -> bool: ...
+
+    def record_publication_receipt(self, claim: WorkClaim, receipt: PublicationReceipt) -> bool: ...
+
+    def finish_publication(self, claim: WorkClaim, publication: Publication, ci: CiEvidence, at: datetime) -> bool: ...
+
+    def fail_work(self, claim: WorkClaim, failure: RunFailure, at: datetime) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +118,13 @@ def _decode_cursor(cursor: str, owner_hash: str, status: RunStatus | None) -> Ru
     return RunPosition(created_at=created_at, run_id=parsed.run_id)
 
 
+def _check_review(run: WorkflowRun, expected_hash: str) -> None:
+    if run.status != RunStatus.AWAITING_REVIEW or run.review is None:
+        raise ReviewClosedError
+    if run.review.feature_sha256 != expected_hash:
+        raise StaleFeatureHashError
+
+
 class RunService:
     def __init__(self, repository: RunRepository) -> None:
         self._repository = repository
@@ -111,6 +150,24 @@ class RunService:
         if run is None:
             raise RunNotFoundError
         return run
+
+    def decide(
+        self, owner: RunOwner, run_id: UUID, decision: DecisionKind, expected_hash: str, reason: str | None
+    ) -> RunStatus:
+        run = self.get(owner, run_id)
+        _check_review(run, expected_hash)
+        record = ReviewDecision(
+            decision=decision,
+            feature_sha256=expected_hash,
+            reviewer=Reviewer(issuer=owner.issuer, subject=owner.subject),
+            decided_at=datetime.now(UTC),
+            reason=reason,
+        )
+        status = self._repository.record_decision(run, record)
+        if status is None:
+            _check_review(self.get(owner, run_id), expected_hash)
+            raise ReviewClosedError
+        return status
 
     def list(self, owner: RunOwner, status: RunStatus | None, limit: int, cursor: str | None) -> RunPage:
         owner_hash = _owner_hash(owner)

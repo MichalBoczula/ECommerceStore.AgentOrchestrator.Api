@@ -12,6 +12,8 @@ type FailureCode = Literal[
     "handoff_version_mismatch",
     "unsupported_criterion",
     "invalid_qa_proposal",
+    "publication_conflict",
+    "publication_revision_mismatch",
     "integration_unavailable",
 ]
 

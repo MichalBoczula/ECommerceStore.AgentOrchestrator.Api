@@ -3,8 +3,9 @@ from typing import NotRequired, TypedDict
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 
+from ecommerce_store_agent_orchestrator.application.runs import WorkflowStepError
 from ecommerce_store_agent_orchestrator.domain.evidence import ReviewSnapshot
 from ecommerce_store_agent_orchestrator.domain.runs import RunStatus, WorkflowRun
 
@@ -19,6 +20,7 @@ class PreparationState(TypedDict):
     qa_session_id: NotRequired[str]
     proposal_id: NotRequired[str]
     feature_sha256: NotRequired[str]
+    review_decision: NotRequired[str]
 
 
 def preparation_input(run: WorkflowRun) -> PreparationState:
@@ -40,8 +42,16 @@ def _stage_handoff(_: PreparationState) -> dict[str, str]:
 
 
 def _review(state: PreparationState) -> dict[str, str]:
-    interrupt({"featureSha256": state["feature_sha256"]})
-    return {}
+    resume = interrupt({"featureSha256": state["feature_sha256"]})
+    if (
+        not isinstance(resume, dict)
+        or resume.get("featureSha256") != state["feature_sha256"]
+        or resume.get("decision") not in ("approve", "reject")
+    ):
+        raise WorkflowStepError("publication_conflict", "The recorded decision does not match this review checkpoint.")
+    decision = resume["decision"]
+    status = RunStatus.PUBLISHING if decision == "approve" else RunStatus.REJECTED
+    return {"review_decision": decision, "status": status.value}
 
 
 def _after_handoff(state: PreparationState) -> str:
@@ -101,3 +111,34 @@ class RunPreparation:
             checkpoint = self._graph.get_state(config)
         if [item.value for item in checkpoint.interrupts] != [{"featureSha256": review.feature_sha256}]:
             raise RuntimeError("The persisted review interrupt does not match the QA proposal")
+
+    def resume_review(self, run: WorkflowRun) -> None:
+        decision = run.decision
+        review = run.review
+        if decision is None or review is None:
+            raise WorkflowStepError("publication_conflict", "The run is missing the saved review or decision.")
+
+        config = thread_config(str(run.run_id))
+        checkpoint = self._graph.get_state(config)
+        expected = {
+            "run_id": str(run.run_id),
+            "qa_session_id": str(review.qa_session_id),
+            "proposal_id": str(review.proposal_id),
+            "feature_sha256": decision.feature_sha256,
+        }
+        if any(checkpoint.values.get(key) != value for key, value in expected.items()):
+            raise WorkflowStepError("publication_conflict", "The decision refers to a different QA proposal.")
+
+        if "review_decision" not in checkpoint.values:
+            pending = [item.value for item in checkpoint.interrupts]
+            if pending != [{"featureSha256": decision.feature_sha256}]:
+                raise WorkflowStepError("publication_conflict", "The pending review checkpoint is unavailable.")
+            self._graph.invoke(
+                Command(resume={"decision": decision.decision, "featureSha256": decision.feature_sha256}),
+                config,
+                durability="sync",
+            )
+            checkpoint = self._graph.get_state(config)
+
+        if checkpoint.values.get("review_decision") != decision.decision or checkpoint.interrupts:
+            raise WorkflowStepError("publication_conflict", "The review checkpoint contains a different decision.")

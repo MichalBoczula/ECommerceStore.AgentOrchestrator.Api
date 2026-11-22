@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, Header, Path, Query, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ecommerce_store_agent_orchestrator.api.contracts import (
+    DecisionAccepted,
+    DecisionInput,
     RunAccepted,
     RunDetail,
     RunPagePayload,
@@ -41,6 +43,7 @@ def _run_service(request: Request) -> RunService:
 
 StartOwner = Annotated[RunOwner, Depends(_require_scope("runs.start"))]
 ReadOwner = Annotated[RunOwner, Depends(_require_scope("runs.read"))]
+ReviewOwner = Annotated[RunOwner, Depends(_require_scope("runs.review"))]
 Service = Annotated[RunService, Depends(_run_service)]
 
 router = APIRouter(prefix="/api/v1/runs", tags=["Runs"])
@@ -92,3 +95,18 @@ def list_runs(
 )
 def get_run(run_id: Annotated[UUID, Path(alias="runId")], owner: ReadOwner, service: Service) -> RunDetail:
     return RunDetail.model_validate(service.get(owner, run_id))
+
+
+@router.post(
+    "/{runId}/decisions",
+    status_code=202,
+    operation_id="decideRun",
+    responses=problem_responses(
+        400, 401, 403, 404, 409, 503, conflict_description="Stale feature hash or closed review."
+    ),
+)
+def decide_run(
+    run_id: Annotated[UUID, Path(alias="runId")], body: DecisionInput, owner: ReviewOwner, service: Service
+) -> DecisionAccepted:
+    status = service.decide(owner, run_id, body.decision, body.expected_feature_sha256, body.reason)
+    return DecisionAccepted(run_id=run_id, status=status)

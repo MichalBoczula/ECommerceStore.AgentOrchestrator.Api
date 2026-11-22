@@ -2,13 +2,14 @@ import json
 import os
 import subprocess
 import sys
+from base64 import b64encode
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
 from uuid import uuid4
 
 import jwt
@@ -36,6 +37,10 @@ BA_DRAFT_HASH = "a" * 64
 QA_SESSION_ID = "10000000-0000-4000-8000-000000000005"
 FEATURE = "Feature: Browse smartphones\n  Scenario: Open a listed phone\n    Then the details show Café\n"
 FEATURE_HASH = sha256(FEATURE.encode("utf-8")).hexdigest()
+FEATURE_PATH = "features/catalog/browse-phone-details.feature"
+E2E_REPOSITORY = "MichalBoczula/ECommerceStore.E2E"
+PULL_SHA = "d" * 40
+MAIN_SHA = "e" * 40
 
 
 @dataclass(frozen=True)
@@ -278,6 +283,13 @@ class AgentStub:
     proposal_snapshot: str | None = None
     lose_first_proposal: bool = False
     proposal_attempts: int = 0
+    already_on_main: bool = False
+    timeout_after_publication: bool = False
+    timeout_simulated: bool = False
+    fail_first_github_lookup: bool = False
+    github_lookups: int = 0
+    published_feature: str = FEATURE
+    created_pulls: dict[tuple[str, str], int] = field(default_factory=dict)
     calls: list[tuple[str, str, dict]] = field(default_factory=list)
 
     def environment(self) -> dict[str, str]:
@@ -287,10 +299,14 @@ class AgentStub:
             "AO_QA_API_URL": f"{self.url}/qa/",
             "AO_QA_API_KEY": "qa-integration-key",
             "AO_SUPPORTED_HANDOFF": json.dumps({**RUN_INPUT, "draftSha256": BA_DRAFT_HASH}),
+            "AO_GITHUB_API_URL": f"{self.url}/github/",
+            "AO_GITHUB_READ_TOKEN": "github-integration-key",
         }
 
     def respond(self, method: str, path: str, key: str | None, body: dict) -> tuple[int, dict]:
         self.calls.append((method, path, body))
+        if method == "GET" and path.startswith("/github/"):
+            return self.github_response(path) if key == "Bearer github-integration-key" else (401, {})
         expected_key = "ba-integration-key" if path.startswith("/ba/") else "qa-integration-key"
         if key != expected_key:
             return 401, {}
@@ -301,6 +317,8 @@ class AgentStub:
         if method == "POST" and path == "/qa/api/v1/sessions":
             return 201, {"id": QA_SESSION_ID, **body}
         if method == "PUT" and path.startswith(f"/qa/api/v1/sessions/{QA_SESSION_ID}/e2e-proposals/"):
+            if path.endswith("/pull-request"):
+                return self.publish_response(path, body)
             self.proposal_attempts += 1
             if self.lose_first_proposal and self.proposal_attempts == 1:
                 return 503, {}
@@ -316,10 +334,43 @@ class AgentStub:
                     "criterion": evidence["process"]["acceptanceCriteria"][0],
                     "sources": [{key: value for key, value in source.items() if key != "title"}],
                 },
-                "path": "features/catalog/browse-phone-details.feature",
+                "path": FEATURE_PATH,
                 "feature": FEATURE,
                 "featureSha256": self.proposal_hash,
             }
+        return 404, {}
+
+    def publish_response(self, path: str, body: dict) -> tuple[int, dict]:
+        if body != {"featureSha256": FEATURE_HASH}:
+            return 409, {}
+        if self.already_on_main:
+            return 200, {"status": "already_current", "repository": E2E_REPOSITORY}
+        key = (path, body["featureSha256"])
+        number = self.created_pulls.setdefault(key, 17 + len(self.created_pulls))
+        return 200, {
+            "status": "pull_request",
+            "repository": E2E_REPOSITORY,
+            "number": number,
+            "branch": f"qa/catalog-phone-details-{FEATURE_HASH[:24]}",
+        }
+
+    def github_response(self, path: str) -> tuple[int, dict]:
+        self.github_lookups += 1
+        if self.fail_first_github_lookup and self.github_lookups == 1:
+            return 503, {}
+        repo = f"/github/repos/{E2E_REPOSITORY}"
+        if path == f"{repo}/git/ref/heads/main":
+            return 200, {"object": {"sha": MAIN_SHA}}
+        if path == f"{repo}/pulls/17" and 17 in self.created_pulls.values():
+            repo_info = {"full_name": E2E_REPOSITORY}
+            return 200, {
+                "number": 17,
+                "head": {"ref": f"qa/catalog-phone-details-{FEATURE_HASH[:24]}", "sha": PULL_SHA, "repo": repo_info},
+                "base": {"ref": "main", "sha": MAIN_SHA, "repo": repo_info},
+            }
+        pinned = MAIN_SHA if self.already_on_main else PULL_SHA
+        if path == f"{repo}/contents/{FEATURE_PATH}?ref={pinned}":
+            return 200, {"encoding": "base64", "content": b64encode(self.published_feature.encode()).decode()}
         return 404, {}
 
     def handoff(self) -> dict:
@@ -368,7 +419,17 @@ def agents() -> Iterator[AgentStub]:
         def answer(self) -> None:
             length = int(self.headers.get("Content-Length", 0))
             data = json.loads(self.rfile.read(length)) if length else {}
-            status, result = stub.respond(self.command, self.path, self.headers.get("X-Api-Key"), data)
+            header = "Authorization" if self.path.startswith("/github/") else "X-Api-Key"
+            status, result = stub.respond(self.command, self.path, self.headers.get(header), data)
+            if (
+                stub.timeout_after_publication
+                and not stub.timeout_simulated
+                and self.path.endswith("/pull-request")
+                and status == 200
+            ):
+                stub.timeout_simulated = True
+                Event().wait(11)
+                return
             body = json.dumps(result).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -520,3 +581,147 @@ def test_invalid_proposal_is_never_reviewable(
     assert response["status"] == "failed"
     assert response["failure"]["code"] == "invalid_qa_proposal"
     assert "review" not in response
+
+
+def _stage_review(api: TestClient, settings: MongoSettings, agents: AgentStub, headers: dict[str, str]) -> str:
+    path = _register_authoring_run(api, headers)
+    for _ in range(3):
+        _worker_once(settings, agents)
+    assert api.get(path, headers=headers).json()["status"] == "awaiting_review"
+    return path
+
+
+def test_review_access_and_one_concurrent_decision(
+    api: TestClient, api_settings: ApiSettings, issuer: TokenIssuer, agents: AgentStub
+) -> None:
+    headers = issuer.headers(scopes="runs.start runs.read runs.review")
+    path = _stage_review(api, api_settings, agents, headers)
+    decision_path = f"{path}/decisions"
+    approval = {"decision": "approve", "expectedFeatureSha256": FEATURE_HASH}
+    assert api.post(decision_path, json=approval, headers=issuer.headers()).status_code == 403
+    other = issuer.headers(subject="operator-2", scopes="runs.review")
+    assert api.post(decision_path, json=approval, headers=other).status_code == 404
+    assert api.post(decision_path, json={**approval, "decision": "reject"}, headers=headers).status_code == 400
+    stale = api.post(decision_path, json={**approval, "expectedFeatureSha256": "0" * 64}, headers=headers)
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "stale_feature_hash"
+
+    barrier = Barrier(6)
+
+    def submit(_attempt: int):
+        barrier.wait(timeout=15)
+        return api.post(decision_path, json=approval, headers=headers)
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        decisions = list(executor.map(submit, range(6)))
+
+    assert sorted(response.status_code for response in decisions) == [202, 409, 409, 409, 409, 409]
+    assert {response.json()["code"] for response in decisions if response.status_code == 409} == {"review_closed"}
+    run = api.get(path, headers=headers).json()
+    assert run["status"] == "publishing"
+    assert run["decision"]["reviewer"] == {"issuer": ISSUER, "subject": "operator-1"}
+    assert run["decision"]["featureSha256"] == FEATURE_HASH
+    assert datetime.fromisoformat(run["decision"]["decidedAt"]).tzinfo is not None
+    assert sum(event["status"] == "publishing" for event in run["history"]) == 1
+    assert not agents.created_pulls
+
+
+def test_rejection_resumes_checkpoint_and_finishes_without_publication(
+    api: TestClient, api_settings: ApiSettings, database: Database[Document], issuer: TokenIssuer, agents: AgentStub
+) -> None:
+    headers = issuer.headers(scopes="runs.start runs.read runs.review")
+    path = _stage_review(api, api_settings, agents, headers)
+    run_id = path.rsplit("/", 1)[1]
+    rejection = {"decision": "reject", "expectedFeatureSha256": FEATURE_HASH, "reason": "The scenario needs a retry."}
+    response = api.post(f"{path}/decisions", json=rejection, headers=headers)
+    assert response.status_code == 202
+    assert response.json() == {"runId": run_id, "status": "rejected"}
+    _worker_once(api_settings)
+
+    run = api.get(path, headers=headers).json()
+    assert run["status"] == "rejected"
+    assert run["decision"]["reason"] == rejection["reason"]
+    assert sum(event["status"] == "rejected" for event in run["history"]) == 1
+    assert "publication" not in run
+    assert [method for method, _, _ in agents.calls] == ["GET", "POST", "PUT"]
+    assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
+    graph = build_preparation_graph(MongoDBSaver(database.client, db_name=database.name))
+    snapshot = graph.get_state(thread_config(run_id))
+    assert snapshot.values["review_decision"] == "reject"
+    assert not snapshot.next and not snapshot.interrupts
+
+
+def test_publication_recovers_one_pull_after_timeout_and_github_retry(
+    api: TestClient, api_settings: ApiSettings, database: Database[Document], issuer: TokenIssuer, agents: AgentStub
+) -> None:
+    agents.timeout_after_publication = True
+    agents.fail_first_github_lookup = True
+    headers = issuer.headers(scopes="runs.start runs.read runs.review")
+    path = _stage_review(api, api_settings, agents, headers)
+    run_id = path.rsplit("/", 1)[1]
+    review = api.get(path, headers=headers).json()["review"]
+    approval = {"decision": "approve", "expectedFeatureSha256": FEATURE_HASH}
+    assert api.post(f"{path}/decisions", json=approval, headers=headers).status_code == 202
+    stored = database.runs.find_one({"_id": run_id})
+    assert stored["publication_request"] == {
+        "qa_session_id": QA_SESSION_ID,
+        "proposal_id": review["proposalId"],
+        "feature_sha256": FEATURE_HASH,
+    }
+    assert not agents.created_pulls
+
+    _worker_once(api_settings, agents)
+    assert agents.timeout_simulated
+    assert len(agents.created_pulls) == 1
+    assert api.get(path, headers=headers).json()["status"] == "publishing"
+    for _ in range(2):
+        database.runs.update_one(
+            {"_id": run_id}, {"$set": {"work.available_at": datetime.now(UTC) - timedelta(seconds=1)}}
+        )
+        _worker_once(api_settings, agents)
+
+    run = api.get(path, headers=headers).json()
+    assert run["status"] == "awaiting_ci"
+    assert run["publication"]["pullRequestNumber"] == 17
+    assert run["publication"]["commitSha"] == PULL_SHA
+    assert run["ci"] == {"status": "pending", "gherkinCheckStatus": "pending"}
+    assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
+    qa_path = f"/qa/api/v1/sessions/{QA_SESSION_ID}/e2e-proposals/{review['proposalId']}/pull-request"
+    assert [call for call in agents.calls if call[1].endswith("/pull-request")] == [
+        ("PUT", qa_path, {"featureSha256": FEATURE_HASH})
+    ] * 2
+    assert agents.created_pulls == {(qa_path, FEATURE_HASH): 17}
+    assert agents.github_lookups == 3
+
+
+@pytest.mark.parametrize("matching_feature", [True, False])
+def test_already_on_main_requires_the_exact_feature_at_a_pinned_commit(
+    api: TestClient, api_settings: ApiSettings, issuer: TokenIssuer, agents: AgentStub, matching_feature: bool
+) -> None:
+    agents.already_on_main = True
+    if not matching_feature:
+        agents.published_feature = "Feature: Unreviewed change\n"
+    headers = issuer.headers(scopes="runs.start runs.read runs.review")
+    path = _stage_review(api, api_settings, agents, headers)
+    approval = {"decision": "approve", "expectedFeatureSha256": FEATURE_HASH}
+    assert api.post(f"{path}/decisions", json=approval, headers=headers).status_code == 202
+    _worker_once(api_settings, agents)
+    run = api.get(path, headers=headers).json()
+    assert not agents.created_pulls
+    if matching_feature:
+        assert run["status"] == "completed"
+        assert run["publication"] == {
+            "outcome": "already_current",
+            "repository": E2E_REPOSITORY,
+            "commitSha": MAIN_SHA,
+            "url": f"https://github.com/{E2E_REPOSITORY}/blob/{MAIN_SHA}/{FEATURE_PATH}",
+        }
+        assert run["ci"] == {
+            "status": "not_applicable",
+            "gherkinCheckStatus": "not_run",
+            "reasonCode": "already_on_main",
+        }
+    else:
+        assert run["status"] == "failed"
+        assert run["failure"]["code"] == "publication_revision_mismatch"
+        assert "publication" not in run

@@ -4,6 +4,13 @@ from enum import StrEnum
 from uuid import UUID
 
 from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
+from ecommerce_store_agent_orchestrator.domain.review import (
+    CiEvidence,
+    Publication,
+    PublicationReceipt,
+    PublicationRequest,
+    ReviewDecision,
+)
 
 
 class RunStatus(StrEnum):
@@ -52,6 +59,11 @@ class WorkflowRun:
     qa_session_id: UUID | None = None
     review: ReviewSnapshot | None = None
     failure: RunFailure | None = None
+    decision: ReviewDecision | None = None
+    publication_request: PublicationRequest | None = None
+    publication_receipt: PublicationReceipt | None = None
+    publication: Publication | None = None
+    ci: CiEvidence | None = None
 
     @property
     def jira_issue_key(self) -> str | None:
