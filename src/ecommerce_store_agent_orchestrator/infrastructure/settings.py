@@ -26,6 +26,8 @@ class WorkerSettings(MongoSettings):
     qa_api_url: AnyHttpUrl | None = None
     qa_api_key: SecretStr | None = None
     supported_handoff: HandoffPin | None = None
+    github_api_url: AnyHttpUrl = AnyHttpUrl("https://api.github.com")
+    github_read_token: SecretStr | None = None
 
     @model_validator(mode="after")
     def validate_authoring_configuration(self) -> Self:

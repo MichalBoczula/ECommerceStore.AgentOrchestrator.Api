@@ -4,8 +4,9 @@ from httpx2 import Client, RequestError, Response
 from pydantic import BaseModel, ValidationError
 
 from ecommerce_store_agent_orchestrator.application.agent_contracts import AuthorSession, PublishedHandoff, QaProposal
-from ecommerce_store_agent_orchestrator.application.authoring import AuthoringError
-from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot
+from ecommerce_store_agent_orchestrator.application.runs import WorkflowStepError
+from ecommerce_store_agent_orchestrator.domain.evidence import FailureCode, HandoffSnapshot
+from ecommerce_store_agent_orchestrator.domain.review import PublicationReceipt, PublicationRequest
 from ecommerce_store_agent_orchestrator.domain.runs import RunInput
 
 
@@ -19,21 +20,21 @@ class HttpAgents:
         try:
             response = self._ba.get(path)
         except RequestError as error:
-            raise AuthoringError("integration_unavailable", "BA could not provide the published handoff.") from error
+            raise WorkflowStepError("integration_unavailable", "BA could not provide the published handoff.") from error
         if response.status_code == 404:
-            raise AuthoringError("handoff_not_found", "BA could not find the requested handoff.")
+            raise WorkflowStepError("handoff_not_found", "BA could not find the requested handoff.")
         if response.status_code == 409:
-            raise AuthoringError("handoff_not_published", "Publish the selected BA run before starting authoring.")
+            raise WorkflowStepError("handoff_not_published", "Publish the selected BA run before starting authoring.")
         if response.status_code != 200:
-            raise AuthoringError("integration_unavailable", "BA could not provide the published handoff.")
+            raise WorkflowStepError("integration_unavailable", "BA could not provide the published handoff.")
 
         try:
             body = response.json()
             if isinstance(body, dict) and body.get("status") in ("draft", "prepared", "approved"):
-                raise AuthoringError("handoff_not_published", "Publish the selected BA run before starting authoring.")
+                raise WorkflowStepError("handoff_not_published", "Publish the BA run before starting authoring.")
             return PublishedHandoff.model_validate(body)
         except ValueError as error:
-            raise AuthoringError("handoff_version_mismatch", "BA returned an invalid published handoff.") from error
+            raise WorkflowStepError("handoff_version_mismatch", "BA returned an invalid published handoff.") from error
 
     def create_author_session(self, handoff: HandoffSnapshot) -> AuthorSession:
         response = self._send_qa(
@@ -55,19 +56,29 @@ class HttpAgents:
         )
         return self._qa_result(response, 200, QaProposal)
 
+    def publish_proposal(self, request: PublicationRequest) -> PublicationReceipt:
+        response = self._send_qa(
+            "PUT",
+            f"api/v1/sessions/{request.qa_session_id}/e2e-proposals/{request.proposal_id}/pull-request",
+            {"featureSha256": request.feature_sha256},
+        )
+        return self._qa_result(response, 200, PublicationReceipt, error_code="publication_conflict")
+
     def _send_qa(self, method: str, path: str, body: dict[str, str | int]) -> Response:
         try:
             return self._qa.request(method, path, json=body)
         except RequestError as error:
-            raise AuthoringError("integration_unavailable", "QA authoring is temporarily unavailable.") from error
+            raise WorkflowStepError("integration_unavailable", "QA is temporarily unavailable.") from error
 
     @staticmethod
-    def _qa_result[T: BaseModel](response: Response, status: int, model: type[T]) -> T:
+    def _qa_result[T: BaseModel](
+        response: Response, status: int, model: type[T], *, error_code: FailureCode = "invalid_qa_proposal"
+    ) -> T:
         if response.status_code in (400, 404, 409, 413):
-            raise AuthoringError("invalid_qa_proposal", "QA rejected the pinned handoff or authoring request.")
+            raise WorkflowStepError(error_code, "QA rejected the pinned handoff or proposal.")
         if response.status_code != status:
-            raise AuthoringError("integration_unavailable", "QA authoring is temporarily unavailable.")
+            raise WorkflowStepError("integration_unavailable", "QA is temporarily unavailable.")
         try:
             return model.model_validate_json(response.content)
         except ValidationError as error:
-            raise AuthoringError("invalid_qa_proposal", "QA returned an invalid authoring response.") from error
+            raise WorkflowStepError(error_code, "QA returned an invalid proposal response.") from error

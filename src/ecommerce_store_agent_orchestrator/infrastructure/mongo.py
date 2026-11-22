@@ -7,6 +7,13 @@ from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
 from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
+from ecommerce_store_agent_orchestrator.domain.review import (
+    CiEvidence,
+    Publication,
+    PublicationReceipt,
+    PublicationRequest,
+    ReviewDecision,
+)
 from ecommerce_store_agent_orchestrator.domain.runs import (
     RunInput,
     RunOwner,
@@ -57,6 +64,19 @@ def _read_run(document: Document) -> WorkflowRun:
         qa_session_id=UUID(document["qa_session_id"]) if "qa_session_id" in document else None,
         review=ReviewSnapshot.model_validate(document["review"]) if "review" in document else None,
         failure=RunFailure.model_validate(document["failure"]) if "failure" in document else None,
+        decision=ReviewDecision.model_validate(document["decision"]) if "decision" in document else None,
+        publication_request=(
+            PublicationRequest.model_validate(document["publication_request"])
+            if "publication_request" in document
+            else None
+        ),
+        publication_receipt=(
+            PublicationReceipt.model_validate(document["publication_receipt"])
+            if "publication_receipt" in document
+            else None
+        ),
+        publication=Publication.model_validate(document["publication"]) if "publication" in document else None,
+        ci=CiEvidence.model_validate(document["ci"]) if "ci" in document else None,
     )
 
 
@@ -121,18 +141,23 @@ class MongoRunRepository:
         documents = self._runs.find(query).sort([("created_at", DESCENDING), ("_id", DESCENDING)]).limit(limit)
         return [_read_run(document) for document in documents]
 
-    def claim_ready(self, now: datetime, lease: timedelta, *, with_authoring: bool = False) -> WorkClaim | None:
+    def claim_ready(
+        self, now: datetime, lease: timedelta, *, with_authoring: bool = False, with_publication: bool = False
+    ) -> WorkClaim | None:
         token = uuid4()
         ready = {"work.available_at": {"$lte": now}}
-        query: Document = {"status": RunStatus.QUEUED.value, **ready}
+        statuses = [RunStatus.QUEUED, RunStatus.REJECTED]
+        if with_publication:
+            statuses.append(RunStatus.PUBLISHING)
         if with_authoring:
-            statuses = (RunStatus.QUEUED, RunStatus.VALIDATING_HANDOFF, RunStatus.AUTHORING_PROPOSAL)
-            query = {
-                "status": {"$in": [status.value for status in statuses]},
-                "$or": [ready, {"status": RunStatus.VALIDATING_HANDOFF.value, "work": {"$exists": False}}],
-            }
+            statuses.extend((RunStatus.VALIDATING_HANDOFF, RunStatus.AUTHORING_PROPOSAL))
+        availability = (
+            {"$or": [ready, {"status": RunStatus.VALIDATING_HANDOFF.value, "work": {"$exists": False}}]}
+            if with_authoring
+            else ready
+        )
         document = self._runs.find_one_and_update(
-            query,
+            {"status": {"$in": [status.value for status in statuses]}, **availability},
             {
                 "$set": {"work.available_at": now + lease, "work.lease_token": str(token)},
                 "$inc": {"work.attempts": 1},
@@ -176,7 +201,59 @@ class MongoRunRepository:
     def mark_review_ready(self, claim: WorkClaim, at: datetime) -> bool:
         return self._advance(claim, RunStatus.AWAITING_REVIEW, at)
 
-    def fail_authoring(self, claim: WorkClaim, failure: RunFailure, at: datetime) -> bool:
+    def record_decision(self, run: WorkflowRun, decision: ReviewDecision) -> RunStatus | None:
+        review = run.review
+        if review is None:
+            return None
+        status = RunStatus.PUBLISHING if decision.decision == "approve" else RunStatus.REJECTED
+        at = decision.decided_at
+        fields: Document = {
+            "decision": decision.model_dump(mode="json"),
+            "status": status.value,
+            "updated_at": at,
+            "work": {"available_at": at},
+        }
+        if status == RunStatus.PUBLISHING:
+            fields["publication_request"] = PublicationRequest(
+                qa_session_id=review.qa_session_id,
+                proposal_id=review.proposal_id,
+                feature_sha256=decision.feature_sha256,
+            ).model_dump(mode="json")
+        result = self._runs.update_one(
+            {
+                "_id": str(run.run_id),
+                **_owner_query(run.owner),
+                "status": RunStatus.AWAITING_REVIEW.value,
+                "decision": {"$exists": False},
+                "review.feature_sha256": decision.feature_sha256,
+                "review.qa_session_id": str(review.qa_session_id),
+                "review.proposal_id": str(review.proposal_id),
+            },
+            {"$set": fields, "$push": {"history": {"status": status.value, "at": at}}},
+        )
+        return status if result.modified_count == 1 else None
+
+    def finish_rejection(self, claim: WorkClaim) -> bool:
+        result = self._runs.update_one(self._claim_query(claim), {"$unset": {"work": ""}})
+        return result.modified_count == 1
+
+    def record_publication_receipt(self, claim: WorkClaim, receipt: PublicationReceipt) -> bool:
+        result = self._runs.update_one(
+            {**self._claim_query(claim), "publication_receipt": {"$exists": False}},
+            {"$set": {"publication_receipt": receipt.model_dump(mode="json")}},
+        )
+        return result.modified_count == 1
+
+    def finish_publication(self, claim: WorkClaim, publication: Publication, ci: CiEvidence, at: datetime) -> bool:
+        status = RunStatus.AWAITING_CI if publication.outcome == "pull_request" else RunStatus.COMPLETED
+        return self._advance(
+            claim,
+            status,
+            at,
+            {"publication": publication.model_dump(mode="json"), "ci": ci.model_dump(mode="json")},
+        )
+
+    def fail_work(self, claim: WorkClaim, failure: RunFailure, at: datetime) -> bool:
         return self._advance(claim, RunStatus.FAILED, at, {"failure": failure.model_dump(mode="json")})
 
     @staticmethod

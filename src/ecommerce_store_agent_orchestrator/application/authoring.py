@@ -13,18 +13,11 @@ from ecommerce_store_agent_orchestrator.application.agent_contracts import (
     QaProposal,
     SourceReference,
 )
-from ecommerce_store_agent_orchestrator.application.runs import RunRepository
-from ecommerce_store_agent_orchestrator.domain.evidence import FailureCode, HandoffSnapshot, ReviewSnapshot, RunFailure
+from ecommerce_store_agent_orchestrator.application.runs import RunRepository, WorkflowStepError
+from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot
 from ecommerce_store_agent_orchestrator.domain.runs import RunInput, RunStatus, WorkClaim, WorkflowRun
 
 _PRODUCTS_PATH = re.compile(r"/mobile-phones(?:/\{[A-Za-z0-9_]+\})?")
-_MAX_INTEGRATION_ATTEMPTS = 3
-
-
-class AuthoringError(Exception):
-    def __init__(self, code: FailureCode, detail: str) -> None:
-        super().__init__(detail)
-        self.failure = RunFailure(code=code, detail=detail)
 
 
 class AgentGateway(Protocol):
@@ -41,7 +34,7 @@ def _validate_handoff(published: PublishedHandoff, pin: HandoffPin) -> HandoffSn
         pin.ba_run_id,
         pin.draft_sha256,
     ) or published.approved_at > published.published_at:
-        raise AuthoringError("handoff_version_mismatch", "The published BA run does not match the approved handoff.")
+        raise WorkflowStepError("handoff_version_mismatch", "The published BA run does not match the approved handoff.")
 
     operation = published.request
     criteria = published.draft.process.acceptance_criteria
@@ -51,12 +44,12 @@ def _validate_handoff(published: PublishedHandoff, pin: HandoffPin) -> HandoffSn
         or _PRODUCTS_PATH.fullmatch(operation.path) is None
         or pin.criterion_index >= len(criteria)
     ):
-        raise AuthoringError("unsupported_criterion", "Select the approved catalog-to-phone-details criterion.")
+        raise WorkflowStepError("unsupported_criterion", "Select the approved catalog-to-phone-details criterion.")
 
     draft = published.draft
     criterion = criteria[pin.criterion_index]
     if not all(text.strip() for text in (criterion.title, criterion.given, criterion.when, criterion.then)):
-        raise AuthoringError("unsupported_criterion", "The selected BA criterion needs a title and Given, When, Then.")
+        raise WorkflowStepError("unsupported_criterion", "The BA criterion needs a title and Given, When, Then.")
     source_ids = {source.id for source in draft.sources}
     source_scope = (operation.service, draft.snapshot_id)
     if (
@@ -64,11 +57,11 @@ def _validate_handoff(published: PublishedHandoff, pin: HandoffPin) -> HandoffSn
         or any((source.service, source.snapshot_id) != source_scope for source in draft.sources)
         or not any(source.path.startswith("sources/openapi.json#/") for source in draft.sources)
     ):
-        raise AuthoringError("handoff_version_mismatch", "BA evidence does not match the handoff's knowledge snapshot.")
+        raise WorkflowStepError("handoff_version_mismatch", "BA evidence does not match the pinned snapshot.")
     if draft.jira_context is not None:
         source_ids.add(f"jira:{draft.jira_context.key}")
     if not set(criterion.source_ids) <= source_ids:
-        raise AuthoringError("handoff_version_mismatch", "The selected criterion references unavailable BA evidence.")
+        raise WorkflowStepError("handoff_version_mismatch", "The criterion references unavailable BA evidence.")
 
     return HandoffSnapshot(
         jira_issue_key=published.jira_issue.key,
@@ -122,22 +115,16 @@ class HandoffAuthoring:
         self._pause_for_review = pause_for_review
 
     def advance(self, claim: WorkClaim) -> None:
-        try:
-            if claim.run.status == RunStatus.VALIDATING_HANDOFF:
-                self._pin_handoff(claim)
-            else:
-                self._author(claim)
-        except AuthoringError as error:
-            if error.failure.code == "integration_unavailable" and claim.attempts < _MAX_INTEGRATION_ATTEMPTS:
-                # The existing lease delays the next attempt and preserves progress saved by this attempt.
-                return
-            self._repository.fail_authoring(claim, error.failure, datetime.now(UTC))
+        if claim.run.status == RunStatus.VALIDATING_HANDOFF:
+            self._pin_handoff(claim)
+        else:
+            self._author(claim)
 
     def _pin_handoff(self, claim: WorkClaim) -> None:
         request = claim.run.input
         pin = self._pin
         if request != RunInput(pin.ba_session_id, pin.ba_run_id, pin.criterion_index):
-            raise AuthoringError("unsupported_criterion", "Select the configured catalog-to-phone-details handoff.")
+            raise WorkflowStepError("unsupported_criterion", "Select the configured catalog-to-phone-details handoff.")
         handoff = _validate_handoff(self._agents.read_handoff(request), pin)
         self._repository.start_authoring(claim, handoff, uuid4(), datetime.now(UTC))
 
@@ -152,13 +139,13 @@ class HandoffAuthoring:
         run = claim.run
         handoff = run.handoff
         if handoff is None or run.proposal_id is None:
-            raise AuthoringError("invalid_qa_proposal", "The run is missing its pinned BA evidence or proposal ID.")
+            raise WorkflowStepError("invalid_qa_proposal", "The run is missing its pinned BA evidence or proposal ID.")
 
         session_id = run.qa_session_id
         if session_id is None:
             session = self._agents.create_author_session(handoff)
             if (session.snapshot_id, session.jira_issue_key) != (handoff.snapshot_id, handoff.jira_issue_key):
-                raise AuthoringError("invalid_qa_proposal", "QA returned a session for different BA evidence.")
+                raise WorkflowStepError("invalid_qa_proposal", "QA returned a session for different BA evidence.")
             session_id = session.id
             if not self._repository.record_qa_session(claim, session_id):
                 return None
@@ -166,7 +153,7 @@ class HandoffAuthoring:
         proposal = self._agents.put_proposal(session_id, run.proposal_id, run.input)
         feature_hash = sha256(proposal.feature.encode("utf-8")).hexdigest()
         if proposal.provenance != _expected_provenance(run.input, handoff) or feature_hash != proposal.feature_sha256:
-            raise AuthoringError(
+            raise WorkflowStepError(
                 "invalid_qa_proposal", "The QA proposal does not match the pinned criterion or its hash."
             )
 

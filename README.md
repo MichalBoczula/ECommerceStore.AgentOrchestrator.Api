@@ -1,7 +1,7 @@
 # ECommerceStore Agent Orchestrator API
 
 The workflow API for the ECommerceStore BA-to-QA review and publication process.
-The API implements the start, list, and detail operations in the
+The API implements the start, list, detail, and decision operations in the
 [OpenAPI contract](docs/openapi/agent-orchestrator.v1.yaml).
 
 ## Run locally
@@ -65,6 +65,8 @@ Set these values for the worker process.
 | `AO_BA_API_URL` and `AO_QA_API_URL` | Base URLs of the BA and QA APIs. |
 | `AO_BA_API_KEY` and `AO_QA_API_KEY` | Service keys sent as `X-Api-Key` to the respective API. |
 | `AO_SUPPORTED_HANDOFF` | JSON object with `baSessionId`, `baRunId`, `draftSha256`, and zero-based `criterionIndex`. |
+| `AO_GITHUB_READ_TOKEN` | Optional GitHub token with read access to E2E pull requests and contents. The public E2E repo can also be read without a token. |
+| `AO_GITHUB_API_URL` | GitHub API base URL. Defaults to `https://api.github.com`. |
 
 Use the published Products Catalog handoff for `GET /mobile-phones` or
 `GET /mobile-phones/{id}` and pin the criterion that covers opening a listed phone and
@@ -77,8 +79,24 @@ and the exact Gherkin and its SHA-256. `awaiting_review` indicates that the work
 checkpoint for that hash. Unsupported or unpublished handoffs report a `failure` in run details.
 Temporary agent errors retry after the worker lease expires, with up to three attempts per stage.
 
+## Review and publish
+
+Send `POST /api/v1/runs/{runId}/decisions` with the run owner's bearer token and
+the `runs.review` scope. The body has `decision` (`approve` or `reject`) and
+`expectedFeatureSha256` from the run detail's review. Include a non-blank
+`reason` for rejection.
+
+HTTP `202` means the reviewer identity, feature hash, decision, and timestamp were
+saved. A stale hash returns `409 stale_feature_hash`. A second decision returns
+`409 review_closed`. The worker resumes the recorded decision after a restart.
+
+Approval queues publication through QA using the saved session, proposal, and hash.
+The worker verifies the feature bytes at the GitHub revision. A verified PR advances
+the run to `awaiting_ci`. Identical content on `main` completes the run with a commit
+permalink. Rejection finishes at review.
+
 ## Verify
 
 With MongoDB 8.0 running, run `uv run pytest`. The integration tests create a fresh database
-per test and use real worker processes, a local test JWKS endpoint, and HTTP fixtures for BA and QA.
+per test and use real worker processes, a local test JWKS endpoint, and HTTP fixtures for BA, QA, and GitHub.
 Set `TEST_MONGODB_URI` to use another MongoDB instance.

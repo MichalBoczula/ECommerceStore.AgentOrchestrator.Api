@@ -9,7 +9,9 @@ from pymongo.errors import PyMongoError
 from ecommerce_store_agent_orchestrator.application.runs import (
     IdempotencyConflictError,
     InvalidCursorError,
+    ReviewClosedError,
     RunNotFoundError,
+    StaleFeatureHashError,
 )
 from ecommerce_store_agent_orchestrator.infrastructure.auth import (
     IdentityProviderUnavailableError,
@@ -35,6 +37,8 @@ _PROBLEMS = {
     InsufficientScopeError: _Problem(403, "forbidden", "The caller lacks permission for this operation"),
     RunNotFoundError: _Problem(404, "run_not_found", "Run not found"),
     IdempotencyConflictError: _Problem(409, "idempotency_key_reused", "Idempotency key already used"),
+    StaleFeatureHashError: _Problem(409, "stale_feature_hash", "The reviewed proposal has a different feature hash"),
+    ReviewClosedError: _Problem(409, "review_closed", "The run no longer accepts a review decision"),
     IdentityProviderUnavailableError: _Problem(503, "orchestrator_unavailable", "Identity provider unavailable"),
     PyMongoError: _Problem(503, "orchestrator_unavailable", "Run storage unavailable"),
 }
@@ -56,7 +60,7 @@ def register_problem_handlers(app: FastAPI) -> None:
         app.add_exception_handler(error, _problem_response)
 
 
-def problem_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
+def problem_responses(*status_codes: int, conflict_description: str | None = None) -> dict[int | str, dict[str, Any]]:
     responses: dict[int | str, dict[str, Any]] = {
         status: {
             "description": next(problem.title for problem in _PROBLEMS.values() if problem.status == status),
@@ -64,5 +68,7 @@ def problem_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
         }
         for status in status_codes
     }
+    if conflict_description is not None:
+        responses[409]["description"] = conflict_description
     responses["default"] = {"description": "Unexpected response."}
     return responses

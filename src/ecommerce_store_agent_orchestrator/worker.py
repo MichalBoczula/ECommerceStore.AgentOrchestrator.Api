@@ -10,9 +10,11 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import PyMongoError
 
 from ecommerce_store_agent_orchestrator.application.authoring import HandoffAuthoring
+from ecommerce_store_agent_orchestrator.application.review import ReviewExecution
 from ecommerce_store_agent_orchestrator.application.worker import RunWorker
 from ecommerce_store_agent_orchestrator.infrastructure.agents import HttpAgents
 from ecommerce_store_agent_orchestrator.infrastructure.mongo import MongoRunRepository, create_client
+from ecommerce_store_agent_orchestrator.infrastructure.publications import GitHubPublicationReader
 from ecommerce_store_agent_orchestrator.infrastructure.run_graph import RunPreparation
 from ecommerce_store_agent_orchestrator.infrastructure.settings import WorkerSettings
 
@@ -32,8 +34,18 @@ def main() -> None:
         repository.ensure_indexes()
         checkpointer = MongoDBSaver(client, db_name=settings.mongodb_database)
         preparation = RunPreparation(checkpointer)
-        authoring = _configure_authoring(resources, repository, preparation, settings)
-        worker = RunWorker(repository, preparation.prepare, timedelta(seconds=settings.worker_lease_seconds), authoring)
+        agents = _configure_agents(resources, settings)
+        pin = settings.supported_handoff
+        authoring = (
+            HandoffAuthoring(repository, agents, pin, preparation.pause_for_review)
+            if agents is not None and pin is not None
+            else None
+        )
+        reader = _configure_github(resources, settings) if agents is not None else None
+        review = ReviewExecution(repository, preparation.resume_review, agents, reader)
+        worker = RunWorker(
+            repository, preparation.prepare, timedelta(seconds=settings.worker_lease_seconds), review, authoring
+        )
 
         if args.once:
             worker.process_one()
@@ -41,11 +53,8 @@ def main() -> None:
             _run_worker(worker, settings.worker_poll_seconds)
 
 
-def _configure_authoring(
-    resources: ExitStack, repository: MongoRunRepository, preparation: RunPreparation, settings: WorkerSettings
-) -> HandoffAuthoring | None:
-    pin = settings.supported_handoff
-    if pin is None:
+def _configure_agents(resources: ExitStack, settings: WorkerSettings) -> HttpAgents | None:
+    if settings.supported_handoff is None:
         return None
     assert settings.ba_api_key and settings.qa_api_key
     ba = resources.enter_context(
@@ -58,7 +67,15 @@ def _configure_authoring(
             base_url=str(settings.qa_api_url), headers={"X-Api-Key": settings.qa_api_key.get_secret_value()}, timeout=10
         )
     )
-    return HandoffAuthoring(repository, HttpAgents(ba, qa), pin, preparation.pause_for_review)
+    return HttpAgents(ba, qa)
+
+
+def _configure_github(resources: ExitStack, settings: WorkerSettings) -> GitHubPublicationReader:
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if settings.github_read_token:
+        headers["Authorization"] = f"Bearer {settings.github_read_token.get_secret_value()}"
+    client = resources.enter_context(Client(base_url=str(settings.github_api_url), headers=headers, timeout=10))
+    return GitHubPublicationReader(client)
 
 
 def _run_worker(worker: RunWorker, poll_seconds: float) -> None:
