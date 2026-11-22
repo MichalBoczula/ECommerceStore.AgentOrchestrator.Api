@@ -4,8 +4,9 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Barrier, Thread
 from uuid import uuid4
@@ -21,7 +22,7 @@ from pymongo.database import Database
 from ecommerce_store_agent_orchestrator.api.app import create_app
 from ecommerce_store_agent_orchestrator.infrastructure.mongo import Document, create_client
 from ecommerce_store_agent_orchestrator.infrastructure.run_graph import build_preparation_graph, thread_config
-from ecommerce_store_agent_orchestrator.infrastructure.settings import ApiSettings
+from ecommerce_store_agent_orchestrator.infrastructure.settings import ApiSettings, MongoSettings
 
 RUNS = "/api/v1/runs"
 RUN_INPUT = {
@@ -31,6 +32,10 @@ RUN_INPUT = {
 }
 ISSUER = "https://orchestrator-tests.example"
 AUDIENCE = "agent-orchestrator-test"
+BA_DRAFT_HASH = "a" * 64
+QA_SESSION_ID = "10000000-0000-4000-8000-000000000005"
+FEATURE = "Feature: Browse smartphones\n  Scenario: Open a listed phone\n    Then the details show Café\n"
+FEATURE_HASH = sha256(FEATURE.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -261,3 +266,257 @@ def test_fresh_worker_resumes_registered_work(
     assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
     if checkpoint == "prepared":
         assert resumed.config == saved.config
+
+
+@dataclass
+class AgentStub:
+    url: str = ""
+    ba_status: int = 200
+    ba_method: str = "GET"
+    draft_hash: str = BA_DRAFT_HASH
+    proposal_hash: str = FEATURE_HASH
+    proposal_snapshot: str | None = None
+    lose_first_proposal: bool = False
+    proposal_attempts: int = 0
+    calls: list[tuple[str, str, dict]] = field(default_factory=list)
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "AO_BA_API_URL": f"{self.url}/ba/",
+            "AO_BA_API_KEY": "ba-integration-key",
+            "AO_QA_API_URL": f"{self.url}/qa/",
+            "AO_QA_API_KEY": "qa-integration-key",
+            "AO_SUPPORTED_HANDOFF": json.dumps({**RUN_INPUT, "draftSha256": BA_DRAFT_HASH}),
+        }
+
+    def respond(self, method: str, path: str, key: str | None, body: dict) -> tuple[int, dict]:
+        self.calls.append((method, path, body))
+        expected_key = "ba-integration-key" if path.startswith("/ba/") else "qa-integration-key"
+        if key != expected_key:
+            return 401, {}
+        if method == "GET" and path == (
+            f"/ba/api/v1/sessions/{RUN_INPUT['baSessionId']}/runs/{RUN_INPUT['baRunId']}/handoff"
+        ):
+            return self.ba_status, self.handoff()
+        if method == "POST" and path == "/qa/api/v1/sessions":
+            return 201, {"id": QA_SESSION_ID, **body}
+        if method == "PUT" and path.startswith(f"/qa/api/v1/sessions/{QA_SESSION_ID}/e2e-proposals/"):
+            self.proposal_attempts += 1
+            if self.lose_first_proposal and self.proposal_attempts == 1:
+                return 503, {}
+            evidence = self.handoff()["draft"]
+            source = evidence["sources"][0]
+            return 200, {
+                "provenance": {
+                    **body,
+                    "snapshotId": self.proposal_snapshot or evidence["snapshotId"],
+                    "draftSha256": self.draft_hash,
+                    "evidenceExchangeId": evidence["evidenceExchangeId"],
+                    "jiraIssueKey": "DEMO-101",
+                    "criterion": evidence["process"]["acceptanceCriteria"][0],
+                    "sources": [{key: value for key, value in source.items() if key != "title"}],
+                },
+                "path": "features/catalog/browse-phone-details.feature",
+                "feature": FEATURE,
+                "featureSha256": self.proposal_hash,
+            }
+        return 404, {}
+
+    def handoff(self) -> dict:
+        return {
+            "id": RUN_INPUT["baRunId"],
+            "sessionId": RUN_INPUT["baSessionId"],
+            "status": "published",
+            "approvedAt": "2026-11-22T11:50:00Z",
+            "publishedAt": "2026-11-22T11:55:00Z",
+            "draftSha256": self.draft_hash,
+            "request": {"service": "products", "method": self.ba_method, "path": "/mobile-phones"},
+            "jiraIssue": {"key": "DEMO-101"},
+            "draft": {
+                "snapshotId": "demo-catalog-v1",
+                "evidenceExchangeId": "10000000-0000-4000-8000-000000000004",
+                "process": {
+                    "acceptanceCriteria": [
+                        {
+                            "title": "View details for a listed phone",
+                            "given": "The catalog is open",
+                            "when": "I select a phone",
+                            "then": "Its details match the selection",
+                            "sourceIds": ["catalog-get"],
+                        }
+                    ]
+                },
+                "sources": [
+                    {
+                        "id": "catalog-get",
+                        "title": "Products Catalog GET contract",
+                        "service": "products",
+                        "snapshotId": "demo-catalog-v1",
+                        "path": "sources/openapi.json#/paths/~1mobile-phones/get",
+                        "commitSha": "b" * 40,
+                    }
+                ],
+            },
+        }
+
+
+@pytest.fixture
+def agents() -> Iterator[AgentStub]:
+    stub = AgentStub()
+
+    class AgentHandler(BaseHTTPRequestHandler):
+        def answer(self) -> None:
+            length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(length)) if length else {}
+            status, result = stub.respond(self.command, self.path, self.headers.get("X-Api-Key"), data)
+            body = json.dumps(result).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = answer
+        do_POST = answer
+        do_PUT = answer
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), AgentHandler) as server:
+        stub.url = f"http://127.0.0.1:{server.server_port}"
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield stub
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def _worker_once(settings: MongoSettings, agents: AgentStub | None = None) -> None:
+    env = {
+        **os.environ,
+        "AO_MONGODB_URI": settings.mongodb_uri.get_secret_value(),
+        "AO_MONGODB_DATABASE": settings.mongodb_database,
+        **(agents.environment() if agents is not None else {}),
+    }
+    worker = [sys.executable, "-m", "ecommerce_store_agent_orchestrator.worker", "--once"]
+    subprocess.run(worker, env=env, check=True, timeout=30)
+
+
+def _register_authoring_run(api: TestClient, headers: dict[str, str], criterion_index: int = 0) -> str:
+    registration = api.post(
+        RUNS,
+        json={**RUN_INPUT, "criterionIndex": criterion_index},
+        headers={**headers, "Idempotency-Key": "authoring-run"},
+    )
+    assert registration.status_code == 202
+    return registration.headers["Location"]
+
+
+def test_gated_authoring_retries_same_proposal_after_restart(
+    api: TestClient, api_settings: ApiSettings, database: Database[Document], issuer: TokenIssuer, agents: AgentStub
+) -> None:
+    agents.lose_first_proposal = True
+    headers = issuer.headers()
+    path = _register_authoring_run(api, headers)
+    run_id = path.rsplit("/", 1)[1]
+
+    _worker_once(api_settings)
+    assert api.get(path, headers=headers).json()["status"] == "validating_handoff"
+    _worker_once(api_settings, agents)
+    assert api.get(path, headers=headers).json()["status"] == "authoring_proposal"
+    _worker_once(api_settings, agents)
+    assert api.get(path, headers=headers).json()["status"] == "authoring_proposal"
+    state = database.runs.find_one({"_id": run_id})
+    assert state["qa_session_id"] == QA_SESSION_ID
+    proposal_id = state["proposal_id"]
+
+    database.runs.update_one({"_id": run_id}, {"$set": {"work.available_at": datetime.now(UTC) - timedelta(seconds=1)}})
+    _worker_once(api_settings, agents)
+    _worker_once(api_settings, agents)
+
+    response = api.get(path, headers=headers).json()
+    assert response["status"] == "awaiting_review"
+    assert response["jiraIssueKey"] == "DEMO-101"
+    assert response["handoff"]["snapshotId"] == "demo-catalog-v1"
+    assert response["handoff"]["draftSha256"] == BA_DRAFT_HASH
+    assert response["handoff"]["criterion"]["sourceIds"] == ["catalog-get"]
+    assert response["handoff"]["sources"][0]["commitSha"] == "b" * 40
+    assert response["review"]["feature"] == FEATURE
+    assert response["review"]["featureSha256"] == FEATURE_HASH
+    assert response["review"]["qaSessionId"] == QA_SESSION_ID
+    assert response["review"]["proposalId"] == proposal_id
+    assert [event["status"] for event in response["history"]] == [
+        "queued",
+        "validating_handoff",
+        "authoring_proposal",
+        "awaiting_review",
+    ]
+    qa_path = f"/qa/api/v1/sessions/{QA_SESSION_ID}/e2e-proposals/{proposal_id}"
+    assert [method for method, _, _ in agents.calls] == ["GET", "POST", "PUT", "PUT"]
+    assert agents.calls[1] == (
+        "POST",
+        "/qa/api/v1/sessions",
+        {"operation": "author", "jiraIssueKey": "DEMO-101", "snapshotId": "demo-catalog-v1"},
+    )
+    assert agents.calls[2:] == [("PUT", qa_path, RUN_INPUT)] * 2
+
+    graph = build_preparation_graph(MongoDBSaver(database.client, db_name=database.name))
+    checkpoint = graph.get_state(thread_config(run_id))
+    assert [item.value for item in checkpoint.interrupts] == [{"featureSha256": FEATURE_HASH}]
+
+
+@pytest.mark.parametrize(
+    ("ba_status", "ba_method", "draft_hash", "criterion_index", "failure"),
+    [
+        (409, "GET", BA_DRAFT_HASH, 0, "handoff_not_published"),
+        (404, "GET", BA_DRAFT_HASH, 0, "handoff_not_found"),
+        (200, "POST", BA_DRAFT_HASH, 0, "unsupported_criterion"),
+        (200, "GET", BA_DRAFT_HASH, 1, "unsupported_criterion"),
+        (200, "GET", "c" * 64, 0, "handoff_version_mismatch"),
+    ],
+)
+def test_failed_handoff_stops_before_qa(
+    api: TestClient,
+    api_settings: ApiSettings,
+    issuer: TokenIssuer,
+    agents: AgentStub,
+    ba_status: int,
+    ba_method: str,
+    draft_hash: str,
+    criterion_index: int,
+    failure: str,
+) -> None:
+    agents.ba_status = ba_status
+    agents.ba_method = ba_method
+    agents.draft_hash = draft_hash
+    headers = issuer.headers()
+    path = _register_authoring_run(api, headers, criterion_index)
+    _worker_once(api_settings, agents)
+    _worker_once(api_settings, agents)
+    response = api.get(path, headers=headers).json()
+    assert response["status"] == "failed"
+    assert response["failure"]["code"] == failure
+    assert response["failure"]["detail"]
+    assert "review" not in response
+    assert [method for method, _, _ in agents.calls] == ([] if criterion_index else ["GET"])
+
+
+@pytest.mark.parametrize("mismatch", ["hash", "snapshot"])
+def test_invalid_proposal_is_never_reviewable(
+    api: TestClient, api_settings: ApiSettings, issuer: TokenIssuer, agents: AgentStub, mismatch: str
+) -> None:
+    if mismatch == "hash":
+        agents.proposal_hash = "0" * 64
+    else:
+        agents.proposal_snapshot = "other-snapshot"
+    headers = issuer.headers()
+    path = _register_authoring_run(api, headers)
+    for _ in range(3):
+        _worker_once(api_settings, agents)
+    response = api.get(path, headers=headers).json()
+    assert response["status"] == "failed"
+    assert response["failure"]["code"] == "invalid_qa_proposal"
+    assert "review" not in response

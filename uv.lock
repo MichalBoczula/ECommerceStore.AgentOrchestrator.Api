@@ -244,6 +244,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx2" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-mongodb" },
     { name = "pydantic" },
@@ -255,7 +256,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx2" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -263,6 +263,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.116,<1" },
+    { name = "httpx2", specifier = ">=2.13,<3" },
     { name = "langgraph", specifier = "==1.2.24" },
     { name = "langgraph-checkpoint-mongodb", specifier = "==0.5.1" },
     { name = "pydantic", specifier = ">=2.11,<3" },
@@ -274,7 +275,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx2", specifier = ">=2.13,<3" },
     { name = "pytest", specifier = ">=9,<10" },
     { name = "ruff", specifier = ">=0.12,<1" },
 ]

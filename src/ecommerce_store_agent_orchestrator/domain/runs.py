@@ -3,6 +3,8 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
+from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
+
 
 class RunStatus(StrEnum):
     QUEUED = "queued"
@@ -45,12 +47,22 @@ class WorkflowRun:
     updated_at: datetime
     history: tuple[StageEvent, ...]
     graph_version: int = 1
+    handoff: HandoffSnapshot | None = None
+    proposal_id: UUID | None = None
+    qa_session_id: UUID | None = None
+    review: ReviewSnapshot | None = None
+    failure: RunFailure | None = None
+
+    @property
+    def jira_issue_key(self) -> str | None:
+        return self.handoff.jira_issue_key if self.handoff is not None else None
 
 
 @dataclass(frozen=True, slots=True)
 class WorkClaim:
     run: WorkflowRun
     token: UUID
+    attempts: int = 1
 
 
 @dataclass(frozen=True, slots=True)
