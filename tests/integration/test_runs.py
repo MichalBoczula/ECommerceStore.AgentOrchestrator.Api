@@ -257,6 +257,7 @@ def test_fresh_worker_resumes_registered_work(
     resumed = graph.get_state(config)
     assert resumed.next == ()
     assert resumed.values["status"] == "validating_handoff"
+    assert resumed.values["graph_version"] == 1
     assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
     if checkpoint == "prepared":
         assert resumed.config == saved.config

@@ -50,6 +50,7 @@ def _read_run(document: Document) -> WorkflowRun:
         created_at=document["created_at"],
         updated_at=document["updated_at"],
         history=tuple(StageEvent(RunStatus(stage["status"]), stage["at"]) for stage in document["history"]),
+        graph_version=document.get("graph_version", 1),
     )
 
 
@@ -81,6 +82,7 @@ class MongoRunRepository:
             "status": run.status.value,
             "created_at": run.created_at,
             "updated_at": run.updated_at,
+            "graph_version": run.graph_version,
             "history": [{"status": stage.status.value, "at": stage.at} for stage in run.history],
             "idempotency_key": idempotency_key,
             "work": {"available_at": run.created_at},

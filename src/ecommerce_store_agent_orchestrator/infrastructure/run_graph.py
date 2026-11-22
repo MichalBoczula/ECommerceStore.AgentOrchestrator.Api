@@ -12,6 +12,7 @@ class PreparationState(TypedDict):
     ba_session_id: str
     ba_run_id: str
     criterion_index: int
+    graph_version: int
     status: NotRequired[str]
 
 
@@ -21,6 +22,7 @@ def preparation_input(run: WorkflowRun) -> PreparationState:
         "ba_session_id": str(run.input.ba_session_id),
         "ba_run_id": str(run.input.ba_run_id),
         "criterion_index": run.input.criterion_index,
+        "graph_version": run.graph_version,
     }
 
 
@@ -55,6 +57,7 @@ class RunPreparation:
         else:
             output = checkpoint.values
 
+        output = {"graph_version": 1, **output}
         if output.get("status") != RunStatus.VALIDATING_HANDOFF.value or any(
             output.get(key) != value for key, value in initial.items()
         ):

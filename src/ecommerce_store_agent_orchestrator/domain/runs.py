@@ -44,6 +44,7 @@ class WorkflowRun:
     created_at: datetime
     updated_at: datetime
     history: tuple[StageEvent, ...]
+    graph_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)

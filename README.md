@@ -10,7 +10,7 @@ Install Python 3.14 and uv, then start MongoDB 8.0.
 
 ~~~sh
 docker compose up -d --wait mongo
-uv sync
+uv sync --locked
 ~~~
 
 Set `AO_AUTH_ISSUER`, `AO_AUTH_AUDIENCE`, and `AO_AUTH_JWKS_URL` from your configured identity provider.
