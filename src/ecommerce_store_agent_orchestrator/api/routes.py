@@ -87,6 +87,7 @@ def list_runs(
 @router.get(
     "/{runId}",
     operation_id="getRun",
+    response_model_exclude_none=True,
     responses=problem_responses(400, 401, 403, 404, 503),
 )
 def get_run(run_id: Annotated[UUID, Path(alias="runId")], owner: ReadOwner, service: Service) -> RunDetail:

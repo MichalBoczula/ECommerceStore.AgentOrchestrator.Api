@@ -6,6 +6,7 @@ from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
+from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
 from ecommerce_store_agent_orchestrator.domain.runs import (
     RunInput,
     RunOwner,
@@ -51,6 +52,11 @@ def _read_run(document: Document) -> WorkflowRun:
         updated_at=document["updated_at"],
         history=tuple(StageEvent(RunStatus(stage["status"]), stage["at"]) for stage in document["history"]),
         graph_version=document.get("graph_version", 1),
+        handoff=HandoffSnapshot.model_validate(document["handoff"]) if "handoff" in document else None,
+        proposal_id=UUID(document["proposal_id"]) if "proposal_id" in document else None,
+        qa_session_id=UUID(document["qa_session_id"]) if "qa_session_id" in document else None,
+        review=ReviewSnapshot.model_validate(document["review"]) if "review" in document else None,
+        failure=RunFailure.model_validate(document["failure"]) if "failure" in document else None,
     )
 
 
@@ -115,28 +121,83 @@ class MongoRunRepository:
         documents = self._runs.find(query).sort([("created_at", DESCENDING), ("_id", DESCENDING)]).limit(limit)
         return [_read_run(document) for document in documents]
 
-    def claim_ready(self, now: datetime, lease: timedelta) -> WorkClaim | None:
+    def claim_ready(self, now: datetime, lease: timedelta, *, with_authoring: bool = False) -> WorkClaim | None:
         token = uuid4()
+        ready = {"work.available_at": {"$lte": now}}
+        query: Document = {"status": RunStatus.QUEUED.value, **ready}
+        if with_authoring:
+            statuses = (RunStatus.QUEUED, RunStatus.VALIDATING_HANDOFF, RunStatus.AUTHORING_PROPOSAL)
+            query = {
+                "status": {"$in": [status.value for status in statuses]},
+                "$or": [ready, {"status": RunStatus.VALIDATING_HANDOFF.value, "work": {"$exists": False}}],
+            }
         document = self._runs.find_one_and_update(
-            {"status": RunStatus.QUEUED.value, "work.available_at": {"$lte": now}},
-            {"$set": {"work.available_at": now + lease, "work.lease_token": str(token)}},
+            query,
+            {
+                "$set": {"work.available_at": now + lease, "work.lease_token": str(token)},
+                "$inc": {"work.attempts": 1},
+            },
             sort=[("work.available_at", ASCENDING), ("_id", ASCENDING)],
             return_document=ReturnDocument.AFTER,
         )
-        return WorkClaim(_read_run(document), token) if document is not None else None
+        return WorkClaim(_read_run(document), token, document["work"]["attempts"]) if document is not None else None
 
     def mark_handoff_ready(self, claim: WorkClaim, at: datetime) -> bool:
-        status = RunStatus.VALIDATING_HANDOFF.value
+        return self._advance(claim, RunStatus.VALIDATING_HANDOFF, at)
+
+    def start_authoring(self, claim: WorkClaim, handoff: HandoffSnapshot, proposal_id: UUID, at: datetime) -> bool:
+        return self._advance(
+            claim,
+            RunStatus.AUTHORING_PROPOSAL,
+            at,
+            {"handoff": handoff.model_dump(mode="json"), "proposal_id": str(proposal_id)},
+            ready=True,
+        )
+
+    def record_qa_session(self, claim: WorkClaim, session_id: UUID) -> bool:
+        result = self._runs.update_one(
+            {**self._claim_query(claim), "qa_session_id": {"$exists": False}},
+            {"$set": {"qa_session_id": str(session_id)}},
+        )
+        return result.modified_count == 1
+
+    def record_review(self, claim: WorkClaim, review: ReviewSnapshot) -> bool:
         result = self._runs.update_one(
             {
-                "_id": str(claim.run.run_id),
-                "status": RunStatus.QUEUED.value,
-                "work.lease_token": str(claim.token),
+                **self._claim_query(claim),
+                "qa_session_id": str(review.qa_session_id),
+                "proposal_id": str(review.proposal_id),
+                "review": {"$exists": False},
             },
-            {
-                "$set": {"status": status, "updated_at": at},
-                "$push": {"history": {"status": status, "at": at}},
-                "$unset": {"work": ""},
-            },
+            {"$set": {"review": review.model_dump(mode="json")}},
+        )
+        return result.modified_count == 1
+
+    def mark_review_ready(self, claim: WorkClaim, at: datetime) -> bool:
+        return self._advance(claim, RunStatus.AWAITING_REVIEW, at)
+
+    def fail_authoring(self, claim: WorkClaim, failure: RunFailure, at: datetime) -> bool:
+        return self._advance(claim, RunStatus.FAILED, at, {"failure": failure.model_dump(mode="json")})
+
+    @staticmethod
+    def _claim_query(claim: WorkClaim) -> Document:
+        return {
+            "_id": str(claim.run.run_id),
+            "status": claim.run.status.value,
+            "work.lease_token": str(claim.token),
+        }
+
+    def _advance(
+        self, claim: WorkClaim, status: RunStatus, at: datetime, data: Document | None = None, *, ready: bool = False
+    ) -> bool:
+        fields = {"status": status.value, "updated_at": at, **(data or {})}
+        update: Document = {"$set": fields, "$push": {"history": {"status": status.value, "at": at}}}
+        if ready:
+            fields["work"] = {"available_at": at}
+        else:
+            update["$unset"] = {"work": ""}
+        result = self._runs.update_one(
+            self._claim_query(claim),
+            update,
         )
         return result.modified_count == 1

@@ -3,7 +3,9 @@ from typing import NotRequired, TypedDict
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
+from ecommerce_store_agent_orchestrator.domain.evidence import ReviewSnapshot
 from ecommerce_store_agent_orchestrator.domain.runs import RunStatus, WorkflowRun
 
 
@@ -14,6 +16,9 @@ class PreparationState(TypedDict):
     criterion_index: int
     graph_version: int
     status: NotRequired[str]
+    qa_session_id: NotRequired[str]
+    proposal_id: NotRequired[str]
+    feature_sha256: NotRequired[str]
 
 
 def preparation_input(run: WorkflowRun) -> PreparationState:
@@ -34,11 +39,22 @@ def _stage_handoff(_: PreparationState) -> dict[str, str]:
     return {"status": RunStatus.VALIDATING_HANDOFF.value}
 
 
+def _review(state: PreparationState) -> dict[str, str]:
+    interrupt({"featureSha256": state["feature_sha256"]})
+    return {}
+
+
+def _after_handoff(state: PreparationState) -> str:
+    return "review" if "feature_sha256" in state else END
+
+
 def build_preparation_graph(checkpointer: BaseCheckpointSaver):
     builder = StateGraph(PreparationState)
     builder.add_node("stage_handoff", _stage_handoff)
+    builder.add_node("review", _review)
     builder.add_edge(START, "stage_handoff")
-    builder.add_edge("stage_handoff", END)
+    builder.add_conditional_edges("stage_handoff", _after_handoff, ["review", END])
+    builder.add_edge("review", END)
     return builder.compile(checkpointer=checkpointer)
 
 
@@ -62,3 +78,26 @@ class RunPreparation:
             output.get(key) != value for key, value in initial.items()
         ):
             raise RuntimeError("The checkpoint does not match the registered run")
+
+    def pause_for_review(self, run: WorkflowRun, review: ReviewSnapshot) -> None:
+        config = thread_config(str(run.run_id))
+        checkpoint = self._graph.get_state(config)
+        if checkpoint.values.get("run_id") != str(run.run_id):
+            raise RuntimeError("Run preparation must be checkpointed before review")
+
+        expected = {
+            "qa_session_id": str(review.qa_session_id),
+            "proposal_id": str(review.proposal_id),
+            "feature_sha256": review.feature_sha256,
+        }
+        if "feature_sha256" not in checkpoint.values:
+            self._graph.update_state(config, expected, as_node="stage_handoff")
+            checkpoint = self._graph.get_state(config)
+        if any(checkpoint.values.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("The checkpoint refers to a different QA proposal")
+
+        if not checkpoint.interrupts and checkpoint.next == ("review",):
+            self._graph.invoke(None, config, durability="sync")
+            checkpoint = self._graph.get_state(config)
+        if [item.value for item in checkpoint.interrupts] != [{"featureSha256": review.feature_sha256}]:
+            raise RuntimeError("The persisted review interrupt does not match the QA proposal")

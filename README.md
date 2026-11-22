@@ -1,7 +1,7 @@
 # ECommerceStore Agent Orchestrator API
 
 The workflow API for the ECommerceStore BA-to-QA review and publication process.
-AO-02 implements the start, list, and detail operations in the
+The API implements the start, list, and detail operations in the
 [OpenAPI contract](docs/openapi/agent-orchestrator.v1.yaml).
 
 ## Run locally
@@ -55,10 +55,30 @@ The list accepts `status`, `limit`, and the returned `nextCursor` as `cursor`.
 
 The API writes the run and pending work together. The worker prepares the same run UUID as
 a LangGraph thread and advances it from `queued` to `validating_handoff`.
-AO-03 adds live BA validation and QA authoring at that stage.
+
+## Enable BA and QA authoring
+
+Set these values for the worker process.
+
+| Variable | Value |
+| --- | --- |
+| `AO_BA_API_URL` and `AO_QA_API_URL` | Base URLs of the BA and QA APIs. |
+| `AO_BA_API_KEY` and `AO_QA_API_KEY` | Service keys sent as `X-Api-Key` to the respective API. |
+| `AO_SUPPORTED_HANDOFF` | JSON object with `baSessionId`, `baRunId`, `draftSha256`, and zero-based `criterionIndex`. |
+
+Use the published Products Catalog handoff for `GET /mobile-phones` or
+`GET /mobile-phones/{id}` and pin the criterion that covers opening a listed phone and
+verifying its details. Submit the same IDs and criterion index in the start request.
+With the authoring variables unset, the local run stops at `validating_handoff`.
+That run is eligible for validation when a configured worker starts.
+
+Run details include the pinned BA criterion and source citations, the QA session and proposal IDs,
+and the exact Gherkin and its SHA-256. `awaiting_review` indicates that the worker saved the review
+checkpoint for that hash. Unsupported or unpublished handoffs report a `failure` in run details.
+Temporary agent errors retry after the worker lease expires, with up to three attempts per stage.
 
 ## Verify
 
 With MongoDB 8.0 running, run `uv run pytest`. The integration tests create a fresh database
-per test and use real worker processes and a local test JWKS endpoint.
+per test and use real worker processes, a local test JWKS endpoint, and HTTP fixtures for BA and QA.
 Set `TEST_MONGODB_URI` to use another MongoDB instance.

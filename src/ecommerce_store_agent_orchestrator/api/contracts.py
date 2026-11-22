@@ -4,6 +4,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
+from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
 from ecommerce_store_agent_orchestrator.domain.runs import RunInput, RunStatus
 
 
@@ -33,6 +34,7 @@ class RunSummary(ApiModel):
     status: RunStatus
     created_at: datetime
     updated_at: datetime
+    jira_issue_key: str | None = None
 
 
 class StageEventPayload(ApiModel):
@@ -43,6 +45,9 @@ class StageEventPayload(ApiModel):
 class RunDetail(RunSummary):
     input: RunInputPayload
     history: list[StageEventPayload]
+    handoff: HandoffSnapshot | None = None
+    review: ReviewSnapshot | None = None
+    failure: RunFailure | None = None
 
 
 class RunPagePayload(ApiModel):
