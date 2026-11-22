@@ -70,7 +70,7 @@ class GitHubClient:
             # The signed download is served by storage and does not need the GitHub bearer token.
             with Client(timeout=10) as download, download.stream("GET", redirect) as archive:
                 return _read_archive(archive)
-        except (RequestError, ValueError):
+        except RequestError, ValueError:
             raise WorkflowStepError("integration_unavailable", "GitHub artifact download is unavailable.") from None
 
 

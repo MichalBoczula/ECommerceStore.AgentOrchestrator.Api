@@ -11,6 +11,7 @@ from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from threading import Barrier, Event, Thread
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 from zipfile import ZipFile
 
@@ -387,8 +388,9 @@ class AgentStub:
         pinned = MAIN_SHA if self.already_on_main else PULL_SHA
         if path == f"{repo}/contents/{FEATURE_PATH}?ref={pinned}":
             return 200, {"encoding": "base64", "content": b64encode(self.published_feature.encode()).decode()}
-        query = f"event=pull_request&head_sha={PULL_SHA}&branch={QA_BRANCH}&per_page=100"
-        if path == f"{repo}/actions/workflows/ci.yml/runs?{query}":
+        request = urlsplit(path)
+        query = {"event": ["pull_request"], "head_sha": [PULL_SHA], "branch": [QA_BRANCH], "per_page": ["100"]}
+        if request.path == f"{repo}/actions/workflows/ci.yml/runs" and parse_qs(request.query) == query:
             return 200, {"workflow_runs": self.ci_runs}
         if path == f"{repo}/actions/runs/{CI_RUN_ID}/attempts/2/jobs?per_page=100":
             return 200, {"jobs": self.ci_jobs}
@@ -778,20 +780,26 @@ def test_already_on_main_requires_the_exact_feature_at_a_pinned_commit(
 
 def _configure_ci_fixture(agents: AgentStub, case: str = "passed") -> None:
     outcome = "failure" if case == "failed" else "success"
-    agents.ci_runs = [{
-        "id": CI_RUN_ID,
-        "run_number": 42,
-        "run_attempt": 2,
-        "event": "pull_request",
-        "status": "in_progress" if case == "pending" else "completed",
-        "head_sha": PULL_SHA,
-        "head_branch": QA_BRANCH,
-        "display_title": f"Storefront PR #{18 if case == 'different_pr' else 17} at {PULL_SHA}",
-        "pull_requests": [],
-    }]
+    agents.ci_runs = [
+        {
+            "id": CI_RUN_ID,
+            "run_number": 42,
+            "run_attempt": 2,
+            "event": "pull_request",
+            "status": "in_progress" if case == "pending" else "completed",
+            "head_sha": PULL_SHA,
+            "head_branch": QA_BRANCH,
+            "display_title": f"Storefront PR #{18 if case == 'different_pr' else 17} at {PULL_SHA}",
+            "pull_requests": [],
+        }
+    ]
     agents.ci_jobs = [
-        {"id": 9101, "name": "check", "status": "completed",
-         "conclusion": "failure" if case == "check_failed" else "success"},
+        {
+            "id": 9101,
+            "name": "check",
+            "status": "completed",
+            "conclusion": "failure" if case == "check_failed" else "success",
+        },
         {
             "id": 9102,
             "name": "storefront",
@@ -808,23 +816,33 @@ def _configure_ci_fixture(agents: AgentStub, case: str = "passed") -> None:
 
     entries = BytesIO()
     with ZipFile(entries, "w") as archive:
-        archive.writestr("storefront-evidence.json", json.dumps({
-            "schemaVersion": 1,
-            "prNumber": 17,
-            "prHeadSha": PULL_SHA,
-            "testedCommitSha": TESTED_SHA,
-            "featureSha256": FEATURE_HASH if case != "wrong_hash" else "0" * 64,
-            "workflowRunId": CI_RUN_ID,
-            "runAttempt": 1 if case == "wrong_attempt" else 2,
-            "playwrightOutcome": outcome,
-        }))
+        archive.writestr(
+            "storefront-evidence.json",
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "prNumber": 17,
+                    "prHeadSha": PULL_SHA,
+                    "testedCommitSha": TESTED_SHA,
+                    "featureSha256": FEATURE_HASH if case != "wrong_hash" else "0" * 64,
+                    "workflowRunId": CI_RUN_ID,
+                    "runAttempt": 1 if case == "wrong_attempt" else 2,
+                    "playwrightOutcome": outcome,
+                }
+            ),
+        )
         scenario_status = {"failed": "failed", "scenario_skipped": "skipped"}.get(case, "passed")
         scenario_id = "AnotherScenario" if case == "other_scenario" else "E2E_Catalog_BrowsePhoneDetails_01"
-        archive.writestr("allure-results/demo-result.json", json.dumps({
-            "status": scenario_status,
-            "stage": "finished",
-            "labels": [{"name": "scenarioId", "value": scenario_id}],
-        }))
+        archive.writestr(
+            "allure-results/demo-result.json",
+            json.dumps(
+                {
+                    "status": scenario_status,
+                    "stage": "finished",
+                    "labels": [{"name": "scenarioId", "value": scenario_id}],
+                }
+            ),
+        )
     agents.ci_archive = entries.getvalue()
     if case == "wrong_merge":
         agents.tested_parent = NEW_HEAD_SHA

@@ -34,12 +34,6 @@ jobs:
         run: uv sync --locked
       - name: Check Python style
         run: |
-          uv run --no-sync ruff format src tests
-          uv run --no-sync ruff check --fix src tests
-          uv run --no-sync ruff format src tests
-          printf '%s\n' 'AO05_FORMAT_PATCH_START'
-          git diff -- src tests
-          printf '%s\n' 'AO05_FORMAT_PATCH_END'
           uv run --no-sync ruff check src tests
           uv run --no-sync ruff format --check src tests
       - name: Verify the local MongoDB service configuration

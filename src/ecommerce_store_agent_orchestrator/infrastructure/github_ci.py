@@ -42,7 +42,8 @@ class _Run(BaseModel):
 
     def matches(self, publication: Publication) -> bool:
         if self.event != "pull_request" or (self.head_sha, self.head_branch) != (
-            publication.commit_sha, publication.branch
+            publication.commit_sha,
+            publication.branch,
         ):
             return False
         if self.pull_requests:
@@ -141,10 +142,7 @@ class GitHubCiReader:
         if storefront is None or storefront.conclusion == "skipped":
             return evidence.model_copy(update={"status": "not_run", "reason_code": "storefront_skipped"})
         step = next(
-            (
-                step for step in storefront.steps or ()
-                if step.name in ("Run storefront Playwright", "Run npm test")
-            ),
+            (step for step in storefront.steps or () if step.name in ("Run storefront Playwright", "Run npm test")),
             None,
         )
         if step is not None and step.started_at and step.conclusion in ("cancelled", "timed_out"):
@@ -165,10 +163,12 @@ class GitHubCiReader:
                 or not self._matches_checkout(manifest.tested_commit_sha, publication.commit_sha)
             ):
                 raise IncompleteEvidenceError("revision_evidence_mismatch")
-            observed = evidence.model_copy(update={
-                "tested_commit_sha": manifest.tested_commit_sha,
-                "allure_artifact": artifact,
-            })
+            observed = evidence.model_copy(
+                update={
+                    "tested_commit_sha": manifest.tested_commit_sha,
+                    "allure_artifact": artifact,
+                }
+            )
             if proof.scenario_status == "passed" and step.conclusion == storefront.conclusion == "success":
                 return observed.model_copy(update={"status": "passed"})
             if proof.scenario_status in ("failed", "broken") and step.conclusion == "failure":

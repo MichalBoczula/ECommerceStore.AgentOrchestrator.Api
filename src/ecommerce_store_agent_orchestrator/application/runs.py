@@ -64,8 +64,13 @@ class RunRepository(Protocol):
     ) -> list[WorkflowRun]: ...
 
     def claim_ready(
-        self, now: datetime, lease: timedelta, *, with_authoring: bool = False, with_publication: bool = False,
-        with_ci: bool = False
+        self,
+        now: datetime,
+        lease: timedelta,
+        *,
+        with_authoring: bool = False,
+        with_publication: bool = False,
+        with_ci: bool = False,
     ) -> WorkClaim | None: ...
 
     def mark_handoff_ready(self, claim: WorkClaim, at: datetime) -> bool: ...

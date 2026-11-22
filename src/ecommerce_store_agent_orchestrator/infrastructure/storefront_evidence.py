@@ -42,7 +42,8 @@ def read_storefront_proof(content: bytes) -> StorefrontProof:
         with ZipFile(BytesIO(content)) as archive:
             entries = archive.infolist()
             manifests = [
-                entry for entry in entries
+                entry
+                for entry in entries
                 if entry.filename in ("storefront-evidence.json", "TestResults/storefront-evidence.json")
             ]
             if len(manifests) != 1 or manifests[0].file_size > _MAX_JSON_BYTES:

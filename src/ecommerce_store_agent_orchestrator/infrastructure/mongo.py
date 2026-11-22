@@ -142,8 +142,13 @@ class MongoRunRepository:
         return [_read_run(document) for document in documents]
 
     def claim_ready(
-        self, now: datetime, lease: timedelta, *, with_authoring: bool = False, with_publication: bool = False,
-        with_ci: bool = False
+        self,
+        now: datetime,
+        lease: timedelta,
+        *,
+        with_authoring: bool = False,
+        with_publication: bool = False,
+        with_ci: bool = False,
     ) -> WorkClaim | None:
         token = uuid4()
         ready = {"work.available_at": {"$lte": now}}
@@ -260,9 +265,7 @@ class MongoRunRepository:
             ready=status == RunStatus.AWAITING_CI,
         )
 
-    def save_ci_evidence(
-        self, claim: WorkClaim, ci: CiEvidence, at: datetime, next_poll_at: datetime | None
-    ) -> bool:
+    def save_ci_evidence(self, claim: WorkClaim, ci: CiEvidence, at: datetime, next_poll_at: datetime | None) -> bool:
         evidence = ci.model_dump(mode="json")
         if next_poll_at is None:
             return self._advance(claim, RunStatus.COMPLETED, at, {"ci": evidence})
