@@ -1,19 +1,19 @@
 name: Orchestrator contract and checkpoint smoke
 
 on:
+  push:
+    branches: [main]
   pull_request:
-    paths:
-      - 'docs/openapi/**'
-      - 'verification/checkpoint_restart_smoke.py'
-      - '.github/workflows/checkpoint-smoke.yml'
 
 permissions:
   contents: read
 
 jobs:
   checkpoint-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
+    env:
+      TEST_MONGODB_URI: mongodb://127.0.0.1:27017
     services:
       mongo:
         image: mongo:8.0
@@ -30,6 +30,16 @@ jobs:
         with:
           version: '0.12.18'
       - run: uv python install 3.14
+      - name: Install API dependencies
+        run: uv sync --locked
+      - name: Check Python style
+        run: |
+          uv run --no-sync ruff check src tests
+          uv run --no-sync ruff format --check src tests
+      - name: Verify the local MongoDB service configuration
+        run: docker compose config --quiet
+      - name: Test API and worker integration
+        run: uv run --no-sync pytest
       - name: Validate OpenAPI
         run: uvx --from openapi-spec-validator==0.7.2 openapi-spec-validator docs/openapi/agent-orchestrator.v1.yaml
       - name: Resume a review after the first worker exits
