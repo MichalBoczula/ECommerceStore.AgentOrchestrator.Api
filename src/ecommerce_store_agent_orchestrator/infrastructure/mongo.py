@@ -26,6 +26,7 @@ def create_client(settings: MongoSettings) -> MongoClient[Document]:
         tz_aware=True,
         w="majority",
         journal=True,
+        readPreference="primary",
         readConcernLevel="majority",
         serverSelectionTimeoutMS=5_000,
         timeoutMS=10_000,

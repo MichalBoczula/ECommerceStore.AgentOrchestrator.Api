@@ -1,24 +1,16 @@
 name: Orchestrator contract and checkpoint smoke
 
 on:
+  push:
+    branches: [main]
   pull_request:
-    paths:
-      - 'docs/openapi/**'
-      - 'src/**'
-      - 'tests/**'
-      - 'pyproject.toml'
-      - 'uv.lock'
-      - '.python-version'
-      - 'compose.yaml'
-      - 'verification/checkpoint_restart_smoke.py'
-      - '.github/workflows/checkpoint-smoke.yml'
 
 permissions:
   contents: read
 
 jobs:
   checkpoint-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 10
     env:
       TEST_MONGODB_URI: mongodb://127.0.0.1:27017
