@@ -49,7 +49,8 @@ class ReviewExecution:
             review is None
             or decision is None
             or decision.decision != "approve"
-            or request != PublicationRequest(
+            or request
+            != PublicationRequest(
                 qa_session_id=review.qa_session_id,
                 proposal_id=review.proposal_id,
                 feature_sha256=decision.feature_sha256,
