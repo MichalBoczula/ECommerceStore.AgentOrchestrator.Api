@@ -1,0 +1,41 @@
+name: Orchestrator contract and checkpoint smoke
+
+on:
+  pull_request:
+    paths:
+      - 'docs/openapi/**'
+      - 'verification/checkpoint_restart_smoke.py'
+      - '.github/workflows/checkpoint-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  checkpoint-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      mongo:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping: 1}).ok ? 0 : 1)'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: '0.12.18'
+      - run: uv python install 3.14
+      - name: Validate OpenAPI
+        run: uvx --from openapi-spec-validator==0.7.2 openapi-spec-validator docs/openapi/agent-orchestrator.v1.yaml
+      - name: Resume a review after the first worker exits
+        env:
+          AO_MONGODB_URI: mongodb://127.0.0.1:27017
+        run: |
+          run_id="$(uv run --no-project --python 3.14 python -c 'from uuid import uuid4; print(uuid4())')"
+          uv run verification/checkpoint_restart_smoke.py pause "$run_id"
+          uv run verification/checkpoint_restart_smoke.py resume "$run_id"
