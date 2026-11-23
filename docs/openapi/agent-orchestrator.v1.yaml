@@ -709,7 +709,7 @@ components:
           minimum: 1
         name:
           type: string
-          enum: [storefront-test-results]
+          pattern: '^storefront-test-results(-attempt-[1-9][0-9]*)?$'
         url:
           type: string
           format: uri

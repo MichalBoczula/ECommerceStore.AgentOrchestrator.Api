@@ -65,7 +65,7 @@ Set these values for the worker process.
 | `AO_BA_API_URL` and `AO_QA_API_URL` | Base URLs of the BA and QA APIs. |
 | `AO_BA_API_KEY` and `AO_QA_API_KEY` | Service keys sent as `X-Api-Key` to the respective API. |
 | `AO_SUPPORTED_HANDOFF` | JSON object with `baSessionId`, `baRunId`, `draftSha256`, and zero-based `criterionIndex`. |
-| `AO_GITHUB_READ_TOKEN` | Optional GitHub token with read access to E2E pull requests and contents. The public E2E repo can also be read without a token. |
+| `AO_GITHUB_READ_TOKEN` | GitHub token with read access to E2E actions, pull requests, and contents. Public repository metadata may also be read without a token. |
 | `AO_GITHUB_API_URL` | GitHub API base URL. Defaults to `https://api.github.com`. |
 
 Use the published Products Catalog handoff for `GET /mobile-phones` or
@@ -94,6 +94,19 @@ Approval queues publication through QA using the saved session, proposal, and ha
 The worker verifies the feature bytes at the GitHub revision. A verified PR advances
 the run to `awaiting_ci`. Identical content on `main` completes the run with a commit
 permalink. Rejection finishes at review.
+
+## Storefront CI evidence
+
+The worker polls the Storefront E2E workflow for the published PR revision. A pending
+observation is saved in MongoDB and scheduled again after 30 seconds. Set
+`E2E_BASE_URL` in the E2E repository to a storefront reachable by Actions with a
+populated catalog so the browser job runs.
+
+Run details report the Gherkin check separately from the Playwright outcome. A
+passing browser result requires the matching attempt's Allure result and a manifest
+that binds the approved feature hash to the actual checkout. The API keeps the PR
+head used by that attempt alongside the latest head observed. It links to the
+GitHub artifact page. Reruns use a separate artifact name for each attempt.
 
 ## Verify
 

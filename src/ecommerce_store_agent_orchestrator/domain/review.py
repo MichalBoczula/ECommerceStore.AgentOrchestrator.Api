@@ -52,7 +52,26 @@ class Publication(EvidenceModel):
     branch: str | None = None
 
 
+type EvidenceId = Annotated[int, Field(ge=1, strict=True)]
+type PlaywrightResult = Literal["pending", "passed", "failed", "not_run", "evidence_missing", "not_applicable"]
+type GherkinCheckResult = Literal["pending", "passed", "failed", "not_run"]
+
+
+class AllureArtifact(EvidenceModel):
+    id: EvidenceId
+    name: str
+    url: str
+
+
 class CiEvidence(EvidenceModel):
-    status: Literal["pending", "not_applicable"]
-    gherkin_check_status: Literal["pending", "not_run"]
+    status: PlaywrightResult
+    gherkin_check_status: GherkinCheckResult
     reason_code: str | None = None
+    workflow_run_id: EvidenceId | None = None
+    workflow_run_url: str | None = None
+    run_attempt: EvidenceId | None = None
+    storefront_job_id: EvidenceId | None = None
+    observed_head_sha: GitSha | None = None
+    tested_commit_sha: GitSha | None = None
+    current_head_sha: GitSha | None = None
+    allure_artifact: AllureArtifact | None = None

@@ -10,9 +10,12 @@ from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.errors import PyMongoError
 
 from ecommerce_store_agent_orchestrator.application.authoring import HandoffAuthoring
+from ecommerce_store_agent_orchestrator.application.ci import CiObservation
 from ecommerce_store_agent_orchestrator.application.review import ReviewExecution
 from ecommerce_store_agent_orchestrator.application.worker import RunWorker
 from ecommerce_store_agent_orchestrator.infrastructure.agents import HttpAgents
+from ecommerce_store_agent_orchestrator.infrastructure.github import GitHubClient
+from ecommerce_store_agent_orchestrator.infrastructure.github_ci import GitHubCiReader
 from ecommerce_store_agent_orchestrator.infrastructure.mongo import MongoRunRepository, create_client
 from ecommerce_store_agent_orchestrator.infrastructure.publications import GitHubPublicationReader
 from ecommerce_store_agent_orchestrator.infrastructure.run_graph import RunPreparation
@@ -41,10 +44,11 @@ def main() -> None:
             if agents is not None and pin is not None
             else None
         )
-        reader = _configure_github(resources, settings) if agents is not None else None
-        review = ReviewExecution(repository, preparation.resume_review, agents, reader)
+        github = _configure_github(resources, settings)
+        review = ReviewExecution(repository, preparation.resume_review, agents, GitHubPublicationReader(github))
+        ci = CiObservation(repository, GitHubCiReader(github))
         worker = RunWorker(
-            repository, preparation.prepare, timedelta(seconds=settings.worker_lease_seconds), review, authoring
+            repository, preparation.prepare, timedelta(seconds=settings.worker_lease_seconds), review, ci, authoring
         )
 
         if args.once:
@@ -70,12 +74,12 @@ def _configure_agents(resources: ExitStack, settings: WorkerSettings) -> HttpAge
     return HttpAgents(ba, qa)
 
 
-def _configure_github(resources: ExitStack, settings: WorkerSettings) -> GitHubPublicationReader:
+def _configure_github(resources: ExitStack, settings: WorkerSettings) -> GitHubClient:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if settings.github_read_token:
         headers["Authorization"] = f"Bearer {settings.github_read_token.get_secret_value()}"
     client = resources.enter_context(Client(base_url=str(settings.github_api_url), headers=headers, timeout=10))
-    return GitHubPublicationReader(client)
+    return GitHubClient(client)
 
 
 def _run_worker(worker: RunWorker, poll_seconds: float) -> None:

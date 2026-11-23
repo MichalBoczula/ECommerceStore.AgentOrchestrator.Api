@@ -9,18 +9,25 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from threading import Barrier, Event, Thread
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
+from zipfile import ZipFile
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+from httpx2 import Client, MockTransport, Request, Response
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import SecretStr
 from pymongo.database import Database
 
 from ecommerce_store_agent_orchestrator.api.app import create_app
+from ecommerce_store_agent_orchestrator.domain.review import Publication
+from ecommerce_store_agent_orchestrator.infrastructure.github import GitHubClient
+from ecommerce_store_agent_orchestrator.infrastructure.github_ci import GitHubCiReader
 from ecommerce_store_agent_orchestrator.infrastructure.mongo import Document, create_client
 from ecommerce_store_agent_orchestrator.infrastructure.run_graph import build_preparation_graph, thread_config
 from ecommerce_store_agent_orchestrator.infrastructure.settings import ApiSettings, MongoSettings
@@ -41,6 +48,10 @@ FEATURE_PATH = "features/catalog/browse-phone-details.feature"
 E2E_REPOSITORY = "MichalBoczula/ECommerceStore.E2E"
 PULL_SHA = "d" * 40
 MAIN_SHA = "e" * 40
+TESTED_SHA = "f" * 40
+NEW_HEAD_SHA = "c" * 40
+CI_RUN_ID = 9123
+QA_BRANCH = f"qa/catalog-phone-details-{FEATURE_HASH[:24]}"
 
 
 @dataclass(frozen=True)
@@ -289,6 +300,12 @@ class AgentStub:
     fail_first_github_lookup: bool = False
     github_lookups: int = 0
     published_feature: str = FEATURE
+    current_head: str = PULL_SHA
+    tested_parent: str = PULL_SHA
+    ci_runs: list[dict] = field(default_factory=list)
+    ci_jobs: list[dict] = field(default_factory=list)
+    ci_artifacts: list[dict] = field(default_factory=list)
+    ci_archive: bytes = b""
     created_pulls: dict[tuple[str, str], int] = field(default_factory=dict)
     calls: list[tuple[str, str, dict]] = field(default_factory=list)
 
@@ -303,7 +320,7 @@ class AgentStub:
             "AO_GITHUB_READ_TOKEN": "github-integration-key",
         }
 
-    def respond(self, method: str, path: str, key: str | None, body: dict) -> tuple[int, dict]:
+    def respond(self, method: str, path: str, key: str | None, body: dict) -> tuple[int, dict | bytes]:
         self.calls.append((method, path, body))
         if method == "GET" and path.startswith("/github/"):
             return self.github_response(path) if key == "Bearer github-integration-key" else (401, {})
@@ -351,10 +368,10 @@ class AgentStub:
             "status": "pull_request",
             "repository": E2E_REPOSITORY,
             "number": number,
-            "branch": f"qa/catalog-phone-details-{FEATURE_HASH[:24]}",
+            "branch": QA_BRANCH,
         }
 
-    def github_response(self, path: str) -> tuple[int, dict]:
+    def github_response(self, path: str) -> tuple[int, dict | bytes]:
         self.github_lookups += 1
         if self.fail_first_github_lookup and self.github_lookups == 1:
             return 503, {}
@@ -365,12 +382,24 @@ class AgentStub:
             repo_info = {"full_name": E2E_REPOSITORY}
             return 200, {
                 "number": 17,
-                "head": {"ref": f"qa/catalog-phone-details-{FEATURE_HASH[:24]}", "sha": PULL_SHA, "repo": repo_info},
+                "head": {"ref": QA_BRANCH, "sha": self.current_head, "repo": repo_info},
                 "base": {"ref": "main", "sha": MAIN_SHA, "repo": repo_info},
             }
         pinned = MAIN_SHA if self.already_on_main else PULL_SHA
         if path == f"{repo}/contents/{FEATURE_PATH}?ref={pinned}":
             return 200, {"encoding": "base64", "content": b64encode(self.published_feature.encode()).decode()}
+        request = urlsplit(path)
+        query = {"event": ["pull_request"], "head_sha": [PULL_SHA], "branch": [QA_BRANCH], "per_page": ["100"]}
+        if request.path == f"{repo}/actions/workflows/ci.yml/runs" and parse_qs(request.query) == query:
+            return 200, {"workflow_runs": self.ci_runs}
+        if path == f"{repo}/actions/runs/{CI_RUN_ID}/attempts/2/jobs?per_page=100":
+            return 200, {"jobs": self.ci_jobs}
+        if path == f"{repo}/actions/runs/{CI_RUN_ID}/artifacts?name=storefront-test-results-attempt-2&per_page=100":
+            return 200, {"artifacts": self.ci_artifacts}
+        if path == f"{repo}/actions/artifacts/9502/zip":
+            return 200, self.ci_archive
+        if path == f"{repo}/commits/{TESTED_SHA}":
+            return 200, {"sha": TESTED_SHA, "parents": [{"sha": MAIN_SHA}, {"sha": self.tested_parent}]}
         return 404, {}
 
     def handoff(self) -> dict:
@@ -430,9 +459,9 @@ def agents() -> Iterator[AgentStub]:
                 stub.timeout_simulated = True
                 Event().wait(11)
                 return
-            body = json.dumps(result).encode()
+            body = result if isinstance(result, bytes) else json.dumps(result).encode()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/zip" if isinstance(result, bytes) else "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -685,13 +714,35 @@ def test_publication_recovers_one_pull_after_timeout_and_github_retry(
     assert run["publication"]["pullRequestNumber"] == 17
     assert run["publication"]["commitSha"] == PULL_SHA
     assert run["ci"] == {"status": "pending", "gherkinCheckStatus": "pending"}
-    assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
+    assert database.runs.count_documents({"_id": run_id, "work.available_at": {"$exists": True}}) == 1
     qa_path = f"/qa/api/v1/sessions/{QA_SESSION_ID}/e2e-proposals/{review['proposalId']}/pull-request"
     assert [call for call in agents.calls if call[1].endswith("/pull-request")] == [
         ("PUT", qa_path, {"featureSha256": FEATURE_HASH})
     ] * 2
     assert agents.created_pulls == {(qa_path, FEATURE_HASH): 17}
     assert agents.github_lookups == 3
+
+    # Runs published by AO-04 had no scheduled CI work.
+    database.runs.update_one({"_id": run_id}, {"$unset": {"work": ""}})
+    _worker_once(api_settings, agents)
+    pending = api.get(path, headers=headers).json()
+    assert pending["status"] == "awaiting_ci"
+    assert pending["ci"]["status"] == "pending"
+    assert database.runs.find_one({"_id": run_id})["work"]["available_at"] > datetime.now(UTC)
+
+    _configure_ci_fixture(agents)
+    agents.current_head = NEW_HEAD_SHA
+    database.runs.update_one({"_id": run_id}, {"$set": {"work.available_at": datetime.now(UTC) - timedelta(seconds=1)}})
+    _worker_once(api_settings, agents)
+    completed = api.get(path, headers=headers).json()
+    assert completed["status"] == "completed"
+    assert completed["ci"]["status"] == "passed"
+    assert completed["ci"]["observedHeadSha"] == PULL_SHA
+    assert completed["ci"]["testedCommitSha"] == TESTED_SHA
+    assert completed["ci"]["currentHeadSha"] == NEW_HEAD_SHA
+    assert completed["ci"]["runAttempt"] == 2
+    assert completed["ci"]["allureArtifact"]["id"] == 9502
+    assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
 
 
 @pytest.mark.parametrize("matching_feature", [True, False])
@@ -725,3 +776,130 @@ def test_already_on_main_requires_the_exact_feature_at_a_pinned_commit(
         assert run["status"] == "failed"
         assert run["failure"]["code"] == "publication_revision_mismatch"
         assert "publication" not in run
+
+
+def _configure_ci_fixture(agents: AgentStub, case: str = "passed") -> None:
+    outcome = "failure" if case == "failed" else "success"
+    agents.ci_runs = [
+        {
+            "id": CI_RUN_ID,
+            "run_number": 42,
+            "run_attempt": 2,
+            "event": "pull_request",
+            "status": "in_progress" if case == "pending" else "completed",
+            "head_sha": PULL_SHA,
+            "head_branch": QA_BRANCH,
+            "display_title": f"Storefront PR #{18 if case == 'different_pr' else 17} at {PULL_SHA}",
+            "pull_requests": [],
+        }
+    ]
+    agents.ci_jobs = [
+        {
+            "id": 9101,
+            "name": "check",
+            "status": "completed",
+            "conclusion": "failure" if case == "check_failed" else "success",
+        },
+        {
+            "id": 9102,
+            "name": "storefront",
+            "status": "completed",
+            "conclusion": "skipped" if case in ("job_skipped", "check_failed") else outcome,
+            "steps": [] if case == "setup_failed" else [{"name": "Run storefront Playwright", "conclusion": outcome}],
+        },
+    ]
+    if case == "interrupted":
+        agents.ci_jobs[1]["steps"][0].update({"conclusion": "cancelled", "started_at": "2026-11-22T21:00:00Z"})
+    agents.ci_artifacts = [{"id": 9501, "name": "storefront-test-results", "expired": False}]
+    if case != "old_artifact":
+        agents.ci_artifacts.append({"id": 9502, "name": "storefront-test-results-attempt-2", "expired": False})
+
+    entries = BytesIO()
+    with ZipFile(entries, "w") as archive:
+        archive.writestr(
+            "storefront-evidence.json",
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "prNumber": 17,
+                    "prHeadSha": PULL_SHA,
+                    "testedCommitSha": TESTED_SHA,
+                    "featureSha256": FEATURE_HASH if case != "wrong_hash" else "0" * 64,
+                    "workflowRunId": CI_RUN_ID,
+                    "runAttempt": 1 if case == "wrong_attempt" else 2,
+                    "playwrightOutcome": outcome,
+                }
+            ),
+        )
+        scenario_status = {"failed": "failed", "scenario_skipped": "skipped"}.get(case, "passed")
+        scenario_id = "AnotherScenario" if case == "other_scenario" else "E2E_Catalog_BrowsePhoneDetails_01"
+        archive.writestr(
+            "allure-results/demo-result.json",
+            json.dumps(
+                {
+                    "status": scenario_status,
+                    "stage": "finished",
+                    "labels": [{"name": "scenarioId", "value": scenario_id}],
+                }
+            ),
+        )
+    agents.ci_archive = entries.getvalue()
+    if case == "wrong_merge":
+        agents.tested_parent = NEW_HEAD_SHA
+
+
+@pytest.mark.parametrize(
+    ("case", "result", "gherkin", "reason"),
+    [
+        ("passed", "passed", "passed", None),
+        ("failed", "failed", "passed", "playwright_failed"),
+        ("pending", "pending", "passed", None),
+        ("different_pr", "pending", "pending", None),
+        ("job_skipped", "not_run", "passed", "storefront_skipped"),
+        ("check_failed", "not_run", "failed", "storefront_skipped"),
+        ("setup_failed", "not_run", "passed", "playwright_not_run"),
+        ("interrupted", "evidence_missing", "passed", "playwright_interrupted"),
+        ("scenario_skipped", "not_run", "passed", "scenario_skipped"),
+        ("old_artifact", "evidence_missing", "passed", "allure_artifact_missing"),
+        ("other_scenario", "evidence_missing", "passed", "scenario_result_missing"),
+        ("wrong_hash", "evidence_missing", "passed", "revision_evidence_mismatch"),
+        ("wrong_attempt", "evidence_missing", "passed", "revision_evidence_mismatch"),
+        ("wrong_merge", "evidence_missing", "passed", "revision_evidence_mismatch"),
+    ],
+)
+def test_ci_result_requires_the_published_revision_and_matching_allure_result(
+    case: str, result: str, gherkin: str, reason: str | None
+) -> None:
+    agents = AgentStub(current_head=NEW_HEAD_SHA)
+    agents.created_pulls[("published", FEATURE_HASH)] = 17
+    _configure_ci_fixture(agents, case)
+
+    def respond(request: Request) -> Response:
+        status, body = agents.github_response(f"/github{request.url.raw_path.decode()}")
+        if isinstance(body, bytes):
+            return Response(status, content=body)
+        return Response(status, json=body)
+
+    publication = Publication(
+        outcome="pull_request",
+        repository=E2E_REPOSITORY,
+        url=f"https://github.com/{E2E_REPOSITORY}/pull/17",
+        commit_sha=PULL_SHA,
+        pull_request_number=17,
+        branch=QA_BRANCH,
+    )
+    with Client(base_url="https://github-ci.example", transport=MockTransport(respond)) as client:
+        evidence = GitHubCiReader(GitHubClient(client)).observe(publication, FEATURE_HASH)
+    assert evidence.status == result
+    assert evidence.gherkin_check_status == gherkin
+    assert evidence.reason_code == reason
+    assert evidence.current_head_sha == NEW_HEAD_SHA
+    if result in ("passed", "failed"):
+        assert evidence.workflow_run_id == CI_RUN_ID
+        assert evidence.run_attempt == 2
+        assert evidence.storefront_job_id == 9102
+        assert evidence.observed_head_sha == PULL_SHA
+        assert evidence.tested_commit_sha == TESTED_SHA
+        assert evidence.allure_artifact is not None
+        assert evidence.allure_artifact.name == "storefront-test-results-attempt-2"
+        assert evidence.allure_artifact.id == 9502

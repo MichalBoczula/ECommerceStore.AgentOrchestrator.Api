@@ -142,18 +142,29 @@ class MongoRunRepository:
         return [_read_run(document) for document in documents]
 
     def claim_ready(
-        self, now: datetime, lease: timedelta, *, with_authoring: bool = False, with_publication: bool = False
+        self,
+        now: datetime,
+        lease: timedelta,
+        *,
+        with_authoring: bool = False,
+        with_publication: bool = False,
+        with_ci: bool = False,
     ) -> WorkClaim | None:
         token = uuid4()
         ready = {"work.available_at": {"$lte": now}}
         statuses = [RunStatus.QUEUED, RunStatus.REJECTED]
+        unscheduled: list[RunStatus] = []
         if with_publication:
             statuses.append(RunStatus.PUBLISHING)
         if with_authoring:
             statuses.extend((RunStatus.VALIDATING_HANDOFF, RunStatus.AUTHORING_PROPOSAL))
+            unscheduled.append(RunStatus.VALIDATING_HANDOFF)
+        if with_ci:
+            statuses.append(RunStatus.AWAITING_CI)
+            unscheduled.append(RunStatus.AWAITING_CI)
         availability = (
-            {"$or": [ready, {"status": RunStatus.VALIDATING_HANDOFF.value, "work": {"$exists": False}}]}
-            if with_authoring
+            {"$or": [ready, {"status": {"$in": [status.value for status in unscheduled]}, "work": {"$exists": False}}]}
+            if unscheduled
             else ready
         )
         document = self._runs.find_one_and_update(
@@ -251,7 +262,18 @@ class MongoRunRepository:
             status,
             at,
             {"publication": publication.model_dump(mode="json"), "ci": ci.model_dump(mode="json")},
+            ready=status == RunStatus.AWAITING_CI,
         )
+
+    def save_ci_evidence(self, claim: WorkClaim, ci: CiEvidence, at: datetime, next_poll_at: datetime | None) -> bool:
+        evidence = ci.model_dump(mode="json")
+        if next_poll_at is None:
+            return self._advance(claim, RunStatus.COMPLETED, at, {"ci": evidence})
+        result = self._runs.update_one(
+            self._claim_query(claim),
+            {"$set": {"ci": evidence, "updated_at": at, "work": {"available_at": next_poll_at}}},
+        )
+        return result.modified_count == 1
 
     def fail_work(self, claim: WorkClaim, failure: RunFailure, at: datetime) -> bool:
         return self._advance(claim, RunStatus.FAILED, at, {"failure": failure.model_dump(mode="json")})
