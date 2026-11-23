@@ -66,6 +66,7 @@ class StageEventPayload(ApiModel):
 class RunDetail(RunSummary):
     input: RunInputPayload
     history: list[StageEventPayload]
+    trace_correlation_id: Sha256
     handoff: HandoffSnapshot | None = None
     review: ReviewSnapshot | None = None
     decision: ReviewDecision | None = None

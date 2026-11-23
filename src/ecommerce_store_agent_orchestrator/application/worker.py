@@ -6,6 +6,7 @@ from ecommerce_store_agent_orchestrator.application.authoring import HandoffAuth
 from ecommerce_store_agent_orchestrator.application.ci import CiObservation
 from ecommerce_store_agent_orchestrator.application.review import ReviewExecution
 from ecommerce_store_agent_orchestrator.application.runs import RunRepository, WorkflowStepError
+from ecommerce_store_agent_orchestrator.application.tracing import WorkOutcome, WorkTrace
 from ecommerce_store_agent_orchestrator.domain.runs import RunStatus, WorkClaim, WorkflowRun
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class RunWorker:
         review: ReviewExecution,
         ci: CiObservation,
         authoring: HandoffAuthoring | None = None,
+        record_trace: Callable[[WorkTrace], None] | None = None,
     ) -> None:
         self._repository = repository
         self._prepare_run = prepare_run
@@ -28,6 +30,7 @@ class RunWorker:
         self._review = review
         self._ci = ci
         self._authoring = authoring
+        self._record_trace = record_trace
 
     def process_one(self) -> bool:
         claim = self._repository.claim_ready(
@@ -40,11 +43,30 @@ class RunWorker:
         if claim is None:
             return False
 
+        started_at = datetime.now(UTC)
+        outcome: WorkOutcome = "error"
         try:
             self._advance(claim)
         except WorkflowStepError as error:
             if error.failure.code != "integration_unavailable" or claim.attempts >= _MAX_INTEGRATION_ATTEMPTS:
                 self._repository.fail_work(claim, error.failure, datetime.now(UTC))
+                outcome = "failed"
+            else:
+                outcome = "retrying"
+        else:
+            outcome = "processed"
+        finally:
+            if self._record_trace is not None:
+                self._record_trace(
+                    WorkTrace(
+                        correlation_id=claim.run.trace_correlation_id,
+                        stage=claim.run.status,
+                        attempt=claim.attempts,
+                        outcome=outcome,
+                        started_at=started_at,
+                        finished_at=datetime.now(UTC),
+                    )
+                )
         return True
 
     def _advance(self, claim: WorkClaim) -> None:

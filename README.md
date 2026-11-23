@@ -108,6 +108,23 @@ that binds the approved feature hash to the actual checkout. The API keeps the P
 head used by that attempt alongside the latest head observed. It links to the
 GitHub artifact page. Reruns use a separate artifact name for each attempt.
 
+## Worker traces
+
+Set `AO_LANGSMITH_API_KEY` on the worker to enable LangSmith export. The default
+`AO_LANGSMITH_PROJECT` is `ecommerce-store-agent-orchestrator`.
+Set `AO_LANGSMITH_API_URL` to your LangSmith API base URL if you use a regional or
+self-hosted endpoint.
+
+Run details expose `traceCorrelationId`. Each exported worker attempt includes
+that ID, its stage, attempt number, outcome and timestamps. Automatic graph
+tracing is disabled in the worker. The explicit traces use empty inputs and
+outputs. Request bodies, raw run and reviewer IDs, and exception messages stay
+in their respective services. A failed trace export leaves the saved workflow
+result available.
+
+Follow the [catalog review demonstration](docs/demo.md) to rehearse transitions,
+restarts, publication recovery and evidence navigation.
+
 ## Verify
 
 With MongoDB 8.0 running, run `uv run pytest`. The integration tests create a fresh database
