@@ -28,6 +28,9 @@ class WorkerSettings(MongoSettings):
     supported_handoff: HandoffPin | None = None
     github_api_url: AnyHttpUrl = AnyHttpUrl("https://api.github.com")
     github_read_token: SecretStr | None = None
+    langsmith_api_key: SecretStr | None = None
+    langsmith_api_url: AnyHttpUrl = AnyHttpUrl("https://api.smith.langchain.com")
+    langsmith_project: str = Field(default="ecommerce-store-agent-orchestrator", min_length=1)
 
     @model_validator(mode="after")
     def validate_authoring_configuration(self) -> Self:

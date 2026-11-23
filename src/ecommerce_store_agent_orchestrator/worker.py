@@ -7,6 +7,7 @@ from threading import Event
 
 from httpx2 import Client
 from langgraph.checkpoint.mongodb import MongoDBSaver
+from langsmith import tracing_context
 from pymongo.errors import PyMongoError
 
 from ecommerce_store_agent_orchestrator.application.authoring import HandoffAuthoring
@@ -16,6 +17,7 @@ from ecommerce_store_agent_orchestrator.application.worker import RunWorker
 from ecommerce_store_agent_orchestrator.infrastructure.agents import HttpAgents
 from ecommerce_store_agent_orchestrator.infrastructure.github import GitHubClient
 from ecommerce_store_agent_orchestrator.infrastructure.github_ci import GitHubCiReader
+from ecommerce_store_agent_orchestrator.infrastructure.langsmith import LangSmithTraceRecorder
 from ecommerce_store_agent_orchestrator.infrastructure.mongo import MongoRunRepository, create_client
 from ecommerce_store_agent_orchestrator.infrastructure.publications import GitHubPublicationReader
 from ecommerce_store_agent_orchestrator.infrastructure.run_graph import RunPreparation
@@ -32,6 +34,8 @@ def main() -> None:
     settings = WorkerSettings()
 
     with ExitStack() as resources:
+        # Graph state contains BA and QA evidence. Export only the worker's explicit trace fields.
+        resources.enter_context(tracing_context(enabled=False))
         client = resources.enter_context(create_client(settings))
         repository = MongoRunRepository(client[settings.mongodb_database])
         repository.ensure_indexes()
@@ -48,7 +52,13 @@ def main() -> None:
         review = ReviewExecution(repository, preparation.resume_review, agents, GitHubPublicationReader(github))
         ci = CiObservation(repository, GitHubCiReader(github))
         worker = RunWorker(
-            repository, preparation.prepare, timedelta(seconds=settings.worker_lease_seconds), review, ci, authoring
+            repository,
+            preparation.prepare,
+            timedelta(seconds=settings.worker_lease_seconds),
+            review,
+            ci,
+            authoring,
+            _configure_tracing(resources, settings),
         )
 
         if args.once:
@@ -80,6 +90,19 @@ def _configure_github(resources: ExitStack, settings: WorkerSettings) -> GitHubC
         headers["Authorization"] = f"Bearer {settings.github_read_token.get_secret_value()}"
     client = resources.enter_context(Client(base_url=str(settings.github_api_url), headers=headers, timeout=10))
     return GitHubClient(client)
+
+
+def _configure_tracing(resources: ExitStack, settings: WorkerSettings) -> LangSmithTraceRecorder | None:
+    if settings.langsmith_api_key is None or not settings.langsmith_api_key.get_secret_value():
+        return None
+    client = resources.enter_context(
+        Client(
+            base_url=str(settings.langsmith_api_url),
+            headers={"x-api-key": settings.langsmith_api_key.get_secret_value()},
+            timeout=2,
+        )
+    )
+    return LangSmithTraceRecorder(client, settings.langsmith_project)
 
 
 def _run_worker(worker: RunWorker, poll_seconds: float) -> None:

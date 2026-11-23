@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from hashlib import sha256
 from uuid import UUID
 
 from ecommerce_store_agent_orchestrator.domain.evidence import HandoffSnapshot, ReviewSnapshot, RunFailure
@@ -68,6 +69,10 @@ class WorkflowRun:
     @property
     def jira_issue_key(self) -> str | None:
         return self.handoff.jira_issue_key if self.handoff is not None else None
+
+    @property
+    def trace_correlation_id(self) -> str:
+        return sha256(b"ecommerce-store-agent-orchestrator:" + self.run_id.bytes).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

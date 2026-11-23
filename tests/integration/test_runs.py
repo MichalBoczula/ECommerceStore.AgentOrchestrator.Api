@@ -249,11 +249,7 @@ def test_fresh_worker_resumes_registered_work(
         run_id = registration.json()["runId"]
         run_path = registration.headers["Location"]
 
-    worker_env = {
-        **os.environ,
-        "AO_MONGODB_URI": api_settings.mongodb_uri.get_secret_value(),
-        "AO_MONGODB_DATABASE": database.name,
-    }
+    worker_env = _worker_environment(api_settings)
     subprocess.run([sys.executable, "-c", _BEFORE_RESTART, run_id, checkpoint], env=worker_env, check=True, timeout=30)
     config = thread_config(run_id)
     graph = build_preparation_graph(MongoDBSaver(database.client, db_name=database.name))
@@ -290,8 +286,10 @@ class AgentStub:
     ba_status: int = 200
     ba_method: str = "GET"
     draft_hash: str = BA_DRAFT_HASH
+    source_snapshot: str = "demo-catalog-v1"
     proposal_hash: str = FEATURE_HASH
     proposal_snapshot: str | None = None
+    proposal_criterion_title: str | None = None
     lose_first_proposal: bool = False
     proposal_attempts: int = 0
     already_on_main: bool = False
@@ -308,9 +306,11 @@ class AgentStub:
     ci_archive: bytes = b""
     created_pulls: dict[tuple[str, str], int] = field(default_factory=dict)
     calls: list[tuple[str, str, dict]] = field(default_factory=list)
+    capture_traces: bool = False
+    traces: list[dict] = field(default_factory=list)
 
     def environment(self) -> dict[str, str]:
-        return {
+        env = {
             "AO_BA_API_URL": f"{self.url}/ba/",
             "AO_BA_API_KEY": "ba-integration-key",
             "AO_QA_API_URL": f"{self.url}/qa/",
@@ -319,8 +319,23 @@ class AgentStub:
             "AO_GITHUB_API_URL": f"{self.url}/github/",
             "AO_GITHUB_READ_TOKEN": "github-integration-key",
         }
+        if self.capture_traces:
+            env.update(
+                AO_LANGSMITH_API_URL=f"{self.url}/langsmith/",
+                AO_LANGSMITH_API_KEY="trace-integration-key",
+                AO_LANGSMITH_PROJECT="orchestrator-rehearsal",
+                LANGSMITH_TRACING="true",
+                LANGSMITH_ENDPOINT=f"{self.url}/automatic-tracing/",
+                LANGSMITH_API_KEY="automatic-tracing-key",
+            )
+        return env
 
     def respond(self, method: str, path: str, key: str | None, body: dict) -> tuple[int, dict | bytes]:
+        if method == "POST" and path == "/langsmith/runs":
+            if key != "trace-integration-key":
+                return 401, {}
+            self.traces.append(body)
+            return 202, {}
         self.calls.append((method, path, body))
         if method == "GET" and path.startswith("/github/"):
             return self.github_response(path) if key == "Bearer github-integration-key" else (401, {})
@@ -341,6 +356,9 @@ class AgentStub:
                 return 503, {}
             evidence = self.handoff()["draft"]
             source = evidence["sources"][0]
+            criterion = evidence["process"]["acceptanceCriteria"][0]
+            if self.proposal_criterion_title is not None:
+                criterion = {**criterion, "title": self.proposal_criterion_title}
             return 200, {
                 "provenance": {
                     **body,
@@ -348,7 +366,7 @@ class AgentStub:
                     "draftSha256": self.draft_hash,
                     "evidenceExchangeId": evidence["evidenceExchangeId"],
                     "jiraIssueKey": "DEMO-101",
-                    "criterion": evidence["process"]["acceptanceCriteria"][0],
+                    "criterion": criterion,
                     "sources": [{key: value for key, value in source.items() if key != "title"}],
                 },
                 "path": FEATURE_PATH,
@@ -431,7 +449,7 @@ class AgentStub:
                         "id": "catalog-get",
                         "title": "Products Catalog GET contract",
                         "service": "products",
-                        "snapshotId": "demo-catalog-v1",
+                        "snapshotId": self.source_snapshot,
                         "path": "sources/openapi.json#/paths/~1mobile-phones/get",
                         "commitSha": "b" * 40,
                     }
@@ -484,15 +502,18 @@ def agents() -> Iterator[AgentStub]:
             thread.join()
 
 
-def _worker_once(settings: MongoSettings, agents: AgentStub | None = None) -> None:
-    env = {
-        **os.environ,
+def _worker_environment(settings: MongoSettings, agents: AgentStub | None = None) -> dict[str, str]:
+    return {
+        **{key: value for key, value in os.environ.items() if not key.startswith(("AO_", "LANGSMITH_", "LANGCHAIN_"))},
         "AO_MONGODB_URI": settings.mongodb_uri.get_secret_value(),
         "AO_MONGODB_DATABASE": settings.mongodb_database,
         **(agents.environment() if agents is not None else {}),
     }
+
+
+def _worker_once(settings: MongoSettings, agents: AgentStub | None = None) -> None:
     worker = [sys.executable, "-m", "ecommerce_store_agent_orchestrator.worker", "--once"]
-    subprocess.run(worker, env=env, check=True, timeout=30)
+    subprocess.run(worker, env=_worker_environment(settings, agents), check=True, timeout=30)
 
 
 def _register_authoring_run(api: TestClient, headers: dict[str, str], criterion_index: int = 0) -> str:
@@ -559,14 +580,16 @@ def test_gated_authoring_retries_same_proposal_after_restart(
 
 
 @pytest.mark.parametrize(
-    ("ba_status", "ba_method", "draft_hash", "criterion_index", "failure"),
+    ("ba_status", "ba_method", "draft_hash", "criterion_index", "source_snapshot", "failure"),
     [
-        (409, "GET", BA_DRAFT_HASH, 0, "handoff_not_published"),
-        (404, "GET", BA_DRAFT_HASH, 0, "handoff_not_found"),
-        (200, "POST", BA_DRAFT_HASH, 0, "unsupported_criterion"),
-        (200, "GET", BA_DRAFT_HASH, 1, "unsupported_criterion"),
-        (200, "GET", "c" * 64, 0, "handoff_version_mismatch"),
+        (409, "GET", BA_DRAFT_HASH, 0, "demo-catalog-v1", "handoff_not_published"),
+        (404, "GET", BA_DRAFT_HASH, 0, "demo-catalog-v1", "handoff_not_found"),
+        (200, "POST", BA_DRAFT_HASH, 0, "demo-catalog-v1", "unsupported_criterion"),
+        (200, "GET", BA_DRAFT_HASH, 1, "demo-catalog-v1", "unsupported_criterion"),
+        (200, "GET", "c" * 64, 0, "demo-catalog-v1", "handoff_version_mismatch"),
+        (200, "GET", BA_DRAFT_HASH, 0, "another-snapshot", "handoff_version_mismatch"),
     ],
+    ids=["unpublished", "missing", "wrong-operation", "wrong-index", "changed-draft", "wrong-source-snapshot"],
 )
 def test_failed_handoff_stops_before_qa(
     api: TestClient,
@@ -577,11 +600,13 @@ def test_failed_handoff_stops_before_qa(
     ba_method: str,
     draft_hash: str,
     criterion_index: int,
+    source_snapshot: str,
     failure: str,
 ) -> None:
     agents.ba_status = ba_status
     agents.ba_method = ba_method
     agents.draft_hash = draft_hash
+    agents.source_snapshot = source_snapshot
     headers = issuer.headers()
     path = _register_authoring_run(api, headers, criterion_index)
     _worker_once(api_settings, agents)
@@ -591,18 +616,21 @@ def test_failed_handoff_stops_before_qa(
     assert response["failure"]["code"] == failure
     assert response["failure"]["detail"]
     assert "review" not in response
+    assert not agents.created_pulls
     assert [method for method, _, _ in agents.calls] == ([] if criterion_index else ["GET"])
 
 
-@pytest.mark.parametrize("mismatch", ["hash", "snapshot"])
+@pytest.mark.parametrize("mismatch", ["hash", "snapshot", "criterion"])
 def test_invalid_proposal_is_never_reviewable(
     api: TestClient, api_settings: ApiSettings, issuer: TokenIssuer, agents: AgentStub, mismatch: str
 ) -> None:
     if mismatch == "hash":
         agents.proposal_hash = "0" * 64
-    else:
+    elif mismatch == "snapshot":
         agents.proposal_snapshot = "other-snapshot"
-    headers = issuer.headers()
+    else:
+        agents.proposal_criterion_title = "Submit a different catalog operation"
+    headers = issuer.headers(scopes="runs.start runs.read runs.review")
     path = _register_authoring_run(api, headers)
     for _ in range(3):
         _worker_once(api_settings, agents)
@@ -610,6 +638,14 @@ def test_invalid_proposal_is_never_reviewable(
     assert response["status"] == "failed"
     assert response["failure"]["code"] == "invalid_qa_proposal"
     assert "review" not in response
+    refused = api.post(
+        f"{path}/decisions",
+        json={"decision": "approve", "expectedFeatureSha256": FEATURE_HASH},
+        headers=headers,
+    )
+    assert refused.status_code == 409
+    assert refused.json()["code"] == "review_closed"
+    assert not agents.created_pulls
 
 
 def _stage_review(api: TestClient, settings: MongoSettings, agents: AgentStub, headers: dict[str, str]) -> str:
@@ -685,10 +721,13 @@ def test_publication_recovers_one_pull_after_timeout_and_github_retry(
 ) -> None:
     agents.timeout_after_publication = True
     agents.fail_first_github_lookup = True
+    agents.capture_traces = True
     headers = issuer.headers(scopes="runs.start runs.read runs.review")
     path = _stage_review(api, api_settings, agents, headers)
     run_id = path.rsplit("/", 1)[1]
-    review = api.get(path, headers=headers).json()["review"]
+    staged = api.get(path, headers=headers).json()
+    review = staged["review"]
+    trace_id = staged["traceCorrelationId"]
     approval = {"decision": "approve", "expectedFeatureSha256": FEATURE_HASH}
     assert api.post(f"{path}/decisions", json=approval, headers=headers).status_code == 202
     stored = database.runs.find_one({"_id": run_id})
@@ -743,6 +782,47 @@ def test_publication_recovers_one_pull_after_timeout_and_github_retry(
     assert completed["ci"]["runAttempt"] == 2
     assert completed["ci"]["allureArtifact"]["id"] == 9502
     assert database.runs.count_documents({"_id": run_id, "work": {"$exists": False}}) == 1
+    assert completed["traceCorrelationId"] == trace_id
+    assert not any(path.startswith("/automatic-tracing/") for _, path, _ in agents.calls)
+    metadata = [trace["extra"]["metadata"] for trace in agents.traces]
+    assert {item["correlation_id"] for item in metadata} == {trace_id}
+    assert (
+        trace_id == sha256(b"ecommerce-store-agent-orchestrator:" + bytes.fromhex(run_id.replace("-", ""))).hexdigest()
+    )
+    assert [(item["stage"], item["outcome"]) for item in metadata] == [
+        ("queued", "processed"),
+        ("validating_handoff", "processed"),
+        ("authoring_proposal", "processed"),
+        ("publishing", "retrying"),
+        ("publishing", "retrying"),
+        ("publishing", "processed"),
+        ("awaiting_ci", "processed"),
+        ("awaiting_ci", "processed"),
+    ]
+    assert all(trace["inputs"] == trace["outputs"] == {} for trace in agents.traces)
+    raw_trace = json.dumps(agents.traces)
+    sensitive_values = (run_id, QA_SESSION_ID, review["proposalId"], "operator-1", "DEMO-101", "integration-key")
+    assert all(value not in raw_trace for value in sensitive_values)
+    assert all(
+        datetime.fromisoformat(trace["start_time"]) <= datetime.fromisoformat(trace["end_time"])
+        for trace in agents.traces
+    )
+    print(
+        json.dumps(
+            {
+                "runId": run_id,
+                "traceCorrelationId": trace_id,
+                "createdPullRequests": len(agents.created_pulls),
+                "stages": [event["status"] for event in completed["history"]],
+                "observedHeadSha": completed["ci"]["observedHeadSha"],
+                "playwright": completed["ci"]["status"],
+                "workflowRunId": completed["ci"]["workflowRunId"],
+                "attempt": completed["ci"]["runAttempt"],
+                "allureArtifact": completed["ci"]["allureArtifact"]["name"],
+            },
+            indent=2,
+        )
+    )
 
 
 @pytest.mark.parametrize("matching_feature", [True, False])
