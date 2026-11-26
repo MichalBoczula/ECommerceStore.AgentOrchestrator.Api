@@ -4,8 +4,9 @@ The workflow API for the ECommerceStore BA-to-QA review and publication process.
 The API implements the start, list, detail, and decision operations in the
 [OpenAPI contract](docs/openapi/agent-orchestrator.v1.yaml).
 
-The CI workflow publishes the verified image to Docker Hub on pushes to `main`
-and manual runs on `main`. Use the digest in the `image-reference` artifact for
+CI publishes the tested and scanned API and worker image to Docker Hub with the
+commit SHA and `latest` tags on pushes to `main`. Manual runs on `main` publish
+the commit SHA tag. Use `imageReference` from the `image-reference` artifact for
 deployment. The image starts the API on port 8080 by default. Run
 `python -m ecommerce_store_agent_orchestrator.worker` as the command of the
 worker container using the same image and MongoDB settings.
